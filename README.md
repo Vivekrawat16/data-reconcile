@@ -173,3 +173,19 @@ Whenever services in Moqui are updated between release tags:
 3. **Detects Deleted/Renamed Services:** Flags services removed from XML files.
 4. **New Services Catalog:** Catalogs all newly introduced services with their implementation type (`inline`, `script`, `oms-rest`, etc.).
 5. **Pre-flight Definition Verification:** Uses Moqui's Service Facade to verify that every new or modified service compiles and loads without error.
+
+---
+
+## 🔬 8. Deep Service Integrity & Scheduled Job Pre-Flight Audit (Phase 2)
+
+Phase 2 builds upon the Service Contract Scanner by analyzing deep runtime linkages and scheduled job compatibility:
+
+1. **Scheduled Job Crash Pre-Flight Check:**
+   - Queries `moqui.service.job.ServiceJob` and `moqui.service.job.ServiceJobParameter` in the database.
+   - Cross-references all active scheduled jobs against services that introduced new `required="true"` parameters in the incoming release tag.
+   - Flags any active job missing the new required parameter with a **`CRITICAL`** alert before cron trigger, preventing production job failures and outages.
+2. **Disk & Component Script Verification:**
+   - For services using `location="component://..."` or `location="file://..."`, resolves the path via Moqui's `ec.resource.getLocationReference(loc)`.
+   - Verifies whether the referenced script file actually exists on the filesystem, catching missing `.groovy` or `.xml` script files before execution.
+3. **Escalated Audit Status:**
+   - Automatically escalates the release health status to `CRITICAL_SCHEDULED_JOBS_AT_RISK` if any active cron job is in danger of failing.
