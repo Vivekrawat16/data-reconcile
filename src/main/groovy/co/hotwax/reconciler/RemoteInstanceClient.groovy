@@ -30,14 +30,6 @@ class RemoteInstanceClient {
         String error
     }
 
-    static class UploadResult {
-        boolean success
-        Integer statusCode
-        String endpoint
-        String error
-        String responseBody
-    }
-
     static FetchResult fetchRemoteEntityResult(String baseUrl, String apiKey, String entityName) {
         FetchResult result = new FetchResult()
         HttpURLConnection conn = null
@@ -92,56 +84,6 @@ class RemoteInstanceClient {
     static List<Map<String, Object>> fetchRemoteEntity(String baseUrl, String apiKey, String entityName) {
         FetchResult result = fetchRemoteEntityResult(baseUrl, apiKey, entityName)
         return result.success ? result.records : []
-    }
-
-    static UploadResult uploadRemoteXmlResult(String baseUrl, String apiKey, String xmlPayload) {
-        UploadResult result = new UploadResult()
-        if (!xmlPayload?.trim()) {
-            result.error = "XML payload is empty"
-            return result
-        }
-
-        HttpURLConnection conn = null
-        try {
-            URL base = validateRemoteBaseUrl(baseUrl)
-            String endpoint = "${base.toExternalForm()}/apps/tools/Entity/DataImport/load"
-            result.endpoint = endpoint
-            conn = openConnection(new URL(endpoint), "POST", apiKey)
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-
-            String wrappedXml = "<entity-facade-xml>\n${xmlPayload}\n</entity-facade-xml>"
-            String form = "onlyCreate=true&xmlText=" + URLEncoder.encode(wrappedXml, StandardCharsets.UTF_8.name())
-            byte[] payload = form.getBytes(StandardCharsets.UTF_8)
-            conn.setFixedLengthStreamingMode(payload.length)
-            conn.outputStream.withCloseable { it.write(payload) }
-
-            int status = conn.responseCode
-            result.statusCode = status
-            String body = readResponse(status >= 200 && status < 300 ? conn.inputStream : conn.errorStream,
-                    status >= 200 && status < 300 ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES)
-            result.responseBody = body
-            if (status < 200 || status >= 300) {
-                result.error = "HTTP ${status} importing create-only XML: ${body}"
-                return result
-            }
-            if (looksLikeHtml(body) || containsImportError(body)) {
-                result.error = "Remote import returned an error or unexpected response: ${abbreviate(body, 1000)}"
-                return result
-            }
-            result.success = true
-            return result
-        } catch (Exception e) {
-            result.error = "${e.class.simpleName}: ${e.message}"
-            logger.warn("Remote create-only XML import failed: ${result.error}")
-            return result
-        } finally {
-            conn?.disconnect()
-        }
-    }
-
-    /** Compatibility wrapper. */
-    static int uploadRemoteXml(String baseUrl, String apiKey, String xmlPayload) {
-        return uploadRemoteXmlResult(baseUrl, apiKey, xmlPayload).success ? 1 : 0
     }
 
     static List<Map<String, Object>> parseMoquiCsv(String body) {

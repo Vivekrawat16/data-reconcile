@@ -3,7 +3,7 @@
           xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
     <service verb="reconcile" noun="ReleaseMetadata" authenticate="true" transaction="ignore" semaphore="fail"
              type="script" location="component://data-reconciler/script/co/hotwax/reconciler/ReconcileReleaseMetadata.groovy">
-        <description>Audits release metadata between a reference and target instance. External input failures stop the audit. Repairs are create-only and require DATA_RECONCILE_ADMIN plus the data.reconciler.autoApplyEnabled JVM flag.</description>
+        <description>Audits release metadata and service contracts between a reference and target instance. External input failures stop the audit. Reports missing seed records, field conflicts, breaking service contract changes, and generates combinedSyncXml.</description>
         <in-parameters>
             <parameter name="fromTag" required="true"><text-length min="1" max="120"/></parameter>
             <parameter name="toTag" required="true"><text-length min="1" max="120"/></parameter>
@@ -17,7 +17,6 @@
             </parameter>
             <parameter name="githubToken" allow-html="none"/>
             <parameter name="entityList" default-value="moqui.basic.EnumerationType,moqui.basic.Enumeration,moqui.basic.StatusType,moqui.basic.StatusItem,moqui.service.message.SystemMessageType" allow-html="none"/>
-            <parameter name="autoApply" type="Boolean" default="false"/>
             <parameter name="githubRepo" allow-html="none"/>
             <parameter name="repoPath" allow-html="none"/>
         </in-parameters>
@@ -29,7 +28,6 @@
             <parameter name="totalCriticalMissing" type="Integer"/>
             <parameter name="totalEnvironmentMissing" type="Integer"/>
             <parameter name="totalConflicts" type="Integer"/>
-            <parameter name="totalAutoApplied" type="Integer"/>
             <parameter name="shiftedComponentsCount" type="Integer"/>
             <parameter name="totalOmissionAlerts" type="Integer"/>
             <parameter name="omissionAlerts" type="List"/>

@@ -9,13 +9,9 @@ Version 2.0 is fail-closed and read-only by default. An unavailable GitHub/refer
 - The REST resource requires authentication.
 - The service requires the `DATA_RECONCILE_ADMIN` permission.
 - Remote instance URLs must use HTTPS, may not resolve to private/local addresses, and may be restricted with `-Ddata.reconciler.allowedHosts=uat.example.com,prod.example.com`.
-- `autoApply` defaults to false.
-- Any incomplete audit blocks apply.
-- Local apply is one atomic transaction and uses create-only entity writes.
-- Remote apply sends `onlyCreate=true` and verifies every expected primary key afterward.
+- The service is strictly read-only and audit-only; it never modifies the database or applies mutations automatically.
 - Existing records and field conflicts are reported and never overwritten.
-- Auto-apply additionally requires `-Ddata.reconciler.autoApplyEnabled=true`.
-- Remote auto-apply also requires `-Ddata.reconciler.remoteApplyEnabled=true`.
+- Generates `combinedSyncXml` containing verified candidate records for manual review or import.
 
 Load `data/ReconcilerSecurityData.xml` as `ext-seed` before using the service. It assigns the permission to the `ADMIN` group; assign it to other operator groups explicitly if required.
 
@@ -46,8 +42,7 @@ curl -X POST https://your-instance.example/rest/s1/reconciler/run \
     "referenceUrl": "https://reference.example",
     "targetUrl": "local",
     "fromTag": "v6.3.0",
-    "toTag": "v6.4.0",
-    "autoApply": false
+    "toTag": "v6.4.0"
   }'
 ```
 
@@ -58,7 +53,6 @@ Important response fields:
 - `errors` and `warnings`: explicit input, scan, validation, and apply outcomes.
 - `resultsByEntity`: missing records, environment-only gaps, and field-level conflicts.
 - `combinedSyncXml`: create-only candidate payload for review.
-- `totalAutoApplied`: committed or remotely verified insert count only.
 
 `githubRepo` bypasses docker-config resolution for one GitHub repository. `repoPath` does the same for one local Git checkout. Without either, component shifts are resolved from `dockerConfigRepo`.
 
@@ -84,4 +78,3 @@ The component tests cover CSV quoting/multiline fields, authentication headers, 
 - Git attribution comes from added data records in Git unified diffs. Ambiguous/incomplete multiline changes stop the audit.
 - Developer omission verification is local-target only; it is skipped with a warning for remote targets.
 - Service definition loading validates the currently deployed target checkout, not an undeployed future artifact.
-- Remote DataImport remains dependent on the target instance's WebTools contract; post-import reads are the final success check.

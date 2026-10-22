@@ -6,7 +6,7 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
 /**
- * Compares source and target configuration data and performs create-only local repairs.
+ * Compares source and target configuration data and identifies missing or conflicting metadata.
  */
 class ReconcileEngine {
     private static final Logger logger = LoggerFactory.getLogger(ReconcileEngine.class)
@@ -187,48 +187,9 @@ class ReconcileEngine {
         result.executionTimeMs = System.currentTimeMillis() - start
         return result
     }
-
-    static Map<String, Object> applyLocalCreateOnly(ExecutionContext ec, Map<String, Map<String, Object>> resultsByEntity) {
-        Map<String, Object> outcome = [success: false, applied: 0, skippedExisting: 0, error: null]
-        boolean beganTransaction = ec.transaction.begin(300)
-        int applied = 0
-        int skipped = 0
-        try {
-            for (Map.Entry<String, Map<String, Object>> entityEntry : resultsByEntity.entrySet()) {
-                String entityName = entityEntry.key
-                Map<String, Object> entityResult = entityEntry.value
-                if (entityResult.success != true) {
-                    throw new IllegalStateException("Cannot apply incomplete audit result for ${entityName}")
-                }
-                List<String> pkFields = (List<String>) entityResult.primaryKeyFields
-                for (Map<String, Object> record : (List<Map<String, Object>>) entityResult.criticalMissingList) {
-                    Map<String, Object> values = record.findAll { String key, Object value -> !key.startsWith("_") }
-                    Map<String, Object> condition = pkFields.collectEntries { String pk -> [(pk): values.get(pk)] }
-                    if (ec.entity.find(entityName).condition(condition).one() != null) {
-                        skipped++
-                        continue
-                    }
-                    ec.entity.makeValue(entityName).setAll(values).create()
-                    applied++
-                }
-            }
-            ec.transaction.commit(beganTransaction)
-            outcome.success = true
-            outcome.applied = applied
-            outcome.skippedExisting = skipped
-            return outcome
-        } catch (Throwable t) {
-            ec.transaction.rollback(beganTransaction, "Create-only reconciliation failed", t)
-            outcome.error = "${t.class.simpleName}: ${t.message}"
-            logger.error("Create-only reconciliation rolled back", t)
-            return outcome
-        }
-    }
-
     /**
-     * Blocks create-only repair when a required parent is neither present on the target nor part of
-     * the same ordered create set. For local targets an explicit entity lookup covers parent rows
-     * that were not returned by the reference export.
+     * Validates that when a child entity record is missing on target, its required parent
+     * is present on target or in the candidate critical missing list.
      */
     static List<String> validateDependencies(
             ExecutionContext ec, Map<String, Map<String, Object>> resultsByEntity, boolean remoteTarget) {
@@ -261,40 +222,6 @@ class ReconcileEngine {
             }
         }
         return errors.unique()
-    }
-
-    static Map<String, Object> applyRemoteCreateOnly(
-            String targetUrl, String targetApiKey, Map<String, Map<String, Object>> resultsByEntity) {
-        String payload = resultsByEntity.values().collect { it.syncXmlPayload ?: "" }.join("")
-        if (!payload) return [success: true, applied: 0, skippedExisting: 0, error: null]
-
-        RemoteInstanceClient.UploadResult upload =
-                RemoteInstanceClient.uploadRemoteXmlResult(targetUrl, targetApiKey, payload)
-        if (!upload.success) return [success: false, applied: 0, skippedExisting: 0, error: upload.error]
-
-        int expected = resultsByEntity.values().sum { ((List) it.criticalMissingList).size() } as int
-        int verified = 0
-        List<String> verificationErrors = []
-        for (Map.Entry<String, Map<String, Object>> entry : resultsByEntity.entrySet()) {
-            String entityName = entry.key
-            Map<String, Object> entityResult = entry.value
-            List<String> pkFields = (List<String>) entityResult.primaryKeyFields
-            RemoteInstanceClient.FetchResult fetched =
-                    RemoteInstanceClient.fetchRemoteEntityResult(targetUrl, targetApiKey, entityName)
-            if (!fetched.success) {
-                verificationErrors.add("${entityName}: ${fetched.error}")
-                continue
-            }
-            Set<String> targetKeys = fetched.records.collect { primaryKey(pkFields, it) }.findAll { it } as Set
-            for (Map<String, Object> record : (List<Map<String, Object>>) entityResult.criticalMissingList) {
-                if (targetKeys.contains(primaryKey(pkFields, record))) verified++
-            }
-        }
-        if (verified != expected || verificationErrors) {
-            return [success: false, applied: verified, skippedExisting: 0,
-                    error: "Remote post-import verification found ${verified}/${expected} records; ${verificationErrors.join('; ')}"]
-        }
-        return [success: true, applied: verified, skippedExisting: 0, error: null]
     }
 
     static List<String> getPkFieldNames(ExecutionContext ec, String entityName) {

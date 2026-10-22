@@ -113,39 +113,12 @@ class ReconcileCoordinator {
                     ServiceIntegrityValidator.runAudit(ec, serviceContext)
             errors.addAll(integrity.errors)
 
-            int applied = 0
-            if (input.autoApply == true) {
-                if (errors) {
-                    errors.add("Auto-apply was blocked because the audit is incomplete")
-                } else if (!"true".equalsIgnoreCase(System.getProperty("data.reconciler.autoApplyEnabled"))) {
-                    errors.add("Auto-apply is disabled; set -Ddata.reconciler.autoApplyEnabled=true after operational approval")
-                } else {
-                    Map<String, Object> applyResult
-                    if (remoteTarget) {
-                        if (!"true".equalsIgnoreCase(System.getProperty("data.reconciler.remoteApplyEnabled"))) {
-                            errors.add("Remote auto-apply is disabled; set -Ddata.reconciler.remoteApplyEnabled=true after operational approval")
-                            applyResult = null
-                        } else {
-                            applyResult = ReconcileEngine.applyRemoteCreateOnly(
-                                    input.targetUrl as String, targetCredential, resultsByEntity)
-                        }
-                    } else {
-                        applyResult = ReconcileEngine.applyLocalCreateOnly(ec, resultsByEntity)
-                    }
-                    if (applyResult != null) {
-                        if (applyResult.success == true) applied = applyResult.applied as int
-                        else errors.add("Create-only apply failed: ${applyResult.error}")
-                    }
-                }
-            }
-
             output.auditComplete = errors.isEmpty()
             output.errors = errors
             output.warnings = warnings
             output.totalCriticalMissing = totalCritical
             output.totalEnvironmentMissing = totalEnvironment
             output.totalConflicts = totalConflicts
-            output.totalAutoApplied = applied
             output.shiftedComponentsCount = shifts.size()
             output.totalOmissionAlerts = omissions.size()
             output.omissionAlerts = omissions
@@ -158,7 +131,7 @@ class ReconcileCoordinator {
             output.resultsByEntity = resultsByEntity
             output.combinedSyncXml = combinedXml.length() ?
                     "<entity-facade-xml>\n${combinedXml}</entity-facade-xml>" : ""
-            output.overallStatus = determineStatus(output, serviceContext, integrity, input.autoApply == true)
+            output.overallStatus = determineStatus(output, serviceContext, integrity)
             output.summaryReport = buildReport(output, fromTag, toTag, input.referenceUrl as String,
                     input.targetUrl as String)
             return output
@@ -207,18 +180,12 @@ class ReconcileCoordinator {
     private static String determineStatus(
             Map<String, Object> output,
             ServiceContractScanner.ServiceDiffContext services,
-            ServiceIntegrityValidator.Phase2AuditResult integrity,
-            boolean autoApplyRequested) {
+            ServiceIntegrityValidator.Phase2AuditResult integrity) {
         if (output.errors) return "AUDIT_INCOMPLETE"
         if (integrity.brokenScheduledJobAlerts) return "CRITICAL_SCHEDULED_JOBS_AT_RISK"
         if (integrity.scriptLocationAlerts) return "SERVICE_SCRIPTS_MISSING"
         if (services.breakingChanges) return "BREAKING_SERVICE_CHANGES_FOUND"
-        if ((output.totalCriticalMissing as int) > 0) {
-            if (autoApplyRequested && (output.totalAutoApplied as int) == (output.totalCriticalMissing as int)) {
-                return "AUTO_REPAIRED_CREATE_ONLY"
-            }
-            return "CRITICAL_MISSING_FOUND"
-        }
+        if ((output.totalCriticalMissing as int) > 0) return "CRITICAL_MISSING_FOUND"
         if ((output.totalConflicts as int) > 0) return "DATA_CONFLICTS_FOUND"
         if ((output.totalOmissionAlerts as int) > 0) return "DEVELOPER_OMISSION_DETECTED"
         return "IN_SYNC"
@@ -237,7 +204,6 @@ class ReconcileCoordinator {
         report.append("Critical missing: ${output.totalCriticalMissing}\n")
         report.append("Environment-only missing: ${output.totalEnvironmentMissing}\n")
         report.append("Field conflicts: ${output.totalConflicts}\n")
-        report.append("Create-only applied: ${output.totalAutoApplied}\n")
         if (output.errors) {
             report.append("Errors:\n")
             ((List) output.errors).each { report.append("  - ${it}\n") }
@@ -276,7 +242,7 @@ class ReconcileCoordinator {
                 overallStatus: "AUDIT_INCOMPLETE", auditComplete: false,
                 errors: [], warnings: [],
                 totalCriticalMissing: 0, totalEnvironmentMissing: 0, totalConflicts: 0,
-                totalAutoApplied: 0, shiftedComponentsCount: 0,
+                shiftedComponentsCount: 0,
                 totalOmissionAlerts: 0, omissionAlerts: [],
                 totalServiceBreakingChanges: 0, serviceBreakingChanges: [],
                 newServicesIntroduced: [], totalAtRiskScheduledJobs: 0,
