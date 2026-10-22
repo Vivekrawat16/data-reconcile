@@ -92,9 +92,9 @@ class DockerConfigReleaseResolver {
             result.shifts = parseDiff(new BufferedReader(new StringReader(diff)))
             List<ComponentShift> incomplete = result.shifts.findAll { !it.fromTag || !it.toTag }
             if (incomplete) {
-                result.errors.add("New components require an explicit baseline and were not scanned: " +
+                result.warnings.add("New components require an explicit baseline and were not scanned: " +
                         incomplete.collect { it.name }.join(", "))
-                return result
+                result.shifts = result.shifts.findAll { it.fromTag && it.toTag }
             }
             result.success = true
             return result
@@ -200,9 +200,11 @@ class DockerConfigReleaseResolver {
                 return result
             }
             result.shifts = parseDiff(new BufferedReader(new StringReader(diff)))
-            if (result.shifts.any { !it.fromTag || !it.toTag }) {
-                result.errors.add("Local diff contains components without a baseline version")
-                return result
+            List<ComponentShift> incomplete = result.shifts.findAll { !it.fromTag || !it.toTag }
+            if (incomplete) {
+                result.warnings.add("Local diff contains components without a baseline version: " +
+                        incomplete.collect { it.name }.join(", "))
+                result.shifts = result.shifts.findAll { it.fromTag && it.toTag }
             }
             result.success = true
             return result
