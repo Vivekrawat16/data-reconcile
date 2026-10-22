@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+
+    <service verb="reconcile" noun="ReleaseMetadata">
+        <description>
+            End-to-End Automated Release Metadata Reconciler:
+            1. Resolves all component version shifts from maarg-docker-config (myaddons.xml and Dockerfiles) between fromTag and toTag.
+            2. Scans GitHub Compare API for all shifted components to extract new entity records (Enumeration, StatusItem, etc.).
+            3. Fetches live reference data from the reference instance.
+            4. Compares with local instance database to identify missing records.
+            5. Flags records introduced in the release as CRITICAL (with the component name that added it).
+            6. If autoApply=true, commits critical records into the local database inside an atomic transaction.
+        </description>
+        <in-parameters>
+            <parameter name="fromTag" required="true">
+                <description>Starting release tag of maarg-docker-config (e.g. v6.4.1 or v6.3.0)</description>
+            </parameter>
+            <parameter name="toTag" required="true">
+                <description>Target release tag of maarg-docker-config (e.g. v6.4.2 or v6.4.0)</description>
+            </parameter>
+            <parameter name="referenceUrl" required="true">
+                <description>Base URL of the reference / source instance (e.g. https://krewe-maarg-uat.hotwax.io)</description>
+            </parameter>
+            <parameter name="referenceApiKey">
+                <description>Bearer Token or Cookie for reference instance authentication</description>
+            </parameter>
+            <parameter name="targetUrl">
+                <description>Optional target instance URL (e.g. https://rails-uat.hotwax.io or https://krewe-maarg.hotwax.io). If omitted or 'local', reconciles against local database.</description>
+            </parameter>
+            <parameter name="targetApiKey">
+                <description>Bearer Token or Cookie for target instance authentication</description>
+            </parameter>
+            <parameter name="dockerConfigRepo" default-value="hotwax/hotwax-maarg-docker-config">
+                <description>Docker config repository defining component versions</description>
+            </parameter>
+            <parameter name="githubToken">
+                <description>GitHub Personal Access Token (auto-detected from ~/.git-credentials if not provided)</description>
+            </parameter>
+            <parameter name="entityList" default-value="moqui.basic.EnumerationType,moqui.basic.Enumeration,moqui.basic.StatusType,moqui.basic.StatusItem,moqui.service.message.SystemMessageType">
+                <description>Comma-separated list of entities to reconcile</description>
+            </parameter>
+            <parameter name="autoApply" type="Boolean" default="false">
+                <description>If true, automatically inserts critical missing records into target instance or local DB</description>
+            </parameter>
+            <parameter name="githubRepo">
+                <description>Optional single repo override if bypassing maarg-docker-config</description>
+            </parameter>
+            <parameter name="repoPath">
+                <description>Optional local path fallback for docker-config</description>
+            </parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="overallStatus"/>
+            <parameter name="totalCriticalMissing" type="Integer"/>
+            <parameter name="totalEnvironmentMissing" type="Integer"/>
+            <parameter name="totalAutoApplied" type="Integer"/>
+            <parameter name="shiftedComponentsCount" type="Integer"/>
+            <parameter name="totalOmissionAlerts" type="Integer"/>
+            <parameter name="omissionAlerts" type="List"/>
+            <parameter name="resultsByEntity" type="Map"/>
+            <parameter name="combinedSyncXml"/>
+            <parameter name="summaryReport"/>
+        </out-parameters>
+        <actions>
+            <script><![CDATA[
+                // Resilient dynamic class resolution to eliminate compile-time ClassNotFound errors
+                GroovyClassLoader gcl = ec.factory.getGroovyClassLoader() ?: new GroovyClassLoader(Thread.currentThread().contextClassLoader ?: ec.class.classLoader)
+                String compPath = ec.factory.getRuntimePath() + "/component/data-reconciler"
+                Class codeScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/CodeReferenceScanner.groovy"))
+                Class scannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/GitDiffScanner.groovy"))
+                Class resolverClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/DockerConfigReleaseResolver.groovy"))
+                gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/RemoteInstanceClient.groovy"))
+                Class engineClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ReconcileEngine.groovy"))
+
+                List<String> entities = entityList.split(",").collect { it.trim() }.findAll { !it.isEmpty() }
+                String token = scannerClass.resolveGithubToken(githubToken)
+                String configRepo = dockerConfigRepo ?: "hotwax/hotwax-maarg-docker-config"
+
+                // 1. Resolve component shifts from maarg-docker-config
+                List shifts = []
+                if (fromTag && toTag) {
+                    shifts = resolverClass.resolveShifts(configRepo, fromTag, toTag, token)
+                }
+
+                // 2. Fetch Git Diff across all shifted components from GitHub Compare API
+                Map<String, Map<String, Map<String, String>>> allGitAdditions = [:]
+                Map<String, String> entityPkOrigins = [:]
+                List<Map> rawCodeRefs = []
+                for (String entity : entities) allGitAdditions[entity] = [:]
+
+                if (shifts) {
+                    for (def shift : shifts) {
+                        if (shift.fromTag && shift.toTag && shift.repo) {
+                            Map compDiff = scannerClass.scanGitHubDiff(
+                                shift.repo, token, shift.fromTag, shift.toTag, entities, shift.name, rawCodeRefs
+                            )
+                            for (String entity : entities) {
+                                Map compEntityMap = compDiff[entity] ?: [:]
+                                for (Map.Entry entry : compEntityMap.entrySet()) {
+                                    allGitAdditions[entity].put(entry.key, entry.value)
+                                    entityPkOrigins.put("${entity}::${entry.key}", "${shift.name} (${shift.fromTag} -> ${shift.toTag})")
+                                }
+                            }
+                        }
+                    }
+                } else if (fromTag && toTag && (githubRepo || repoPath)) {
+                    // Fallback to direct repo if no docker-config shifts found
+                    allGitAdditions = scannerClass.scanDiff(githubRepo, token, repoPath, fromTag, toTag, entities)
+                }
+
+                Map results = [:]
+                int totalCritical = 0
+                int totalEnv = 0
+                int totalApplied = 0
+                StringBuilder fullXml = new StringBuilder()
+                StringBuilder report = new StringBuilder()
+
+                String targetDisplay = targetUrl && !targetUrl.equalsIgnoreCase("local") ? targetUrl : "Local Database"
+                report.append("================================================================================\n")
+                report.append("                    AUTOMATED RELEASE RECONCILIATION REPORT                     \n")
+                report.append("================================================================================\n")
+                report.append("Reference (Source) : ${referenceUrl}\n")
+                report.append("Target Instance    : ${targetDisplay}\n")
+                report.append("Docker Config Tag  : ${fromTag ?: 'N/A'} -> ${toTag ?: 'N/A'} (${configRepo})\n")
+                report.append("Auto-Apply         : ${autoApply}\n")
+                report.append("Shifted Components : ${shifts ? shifts.size() : 0} shifted components detected\n")
+                report.append("================================================================================\n\n")
+
+                List<Map> tableRows = []
+                for (String entity : entities) {
+                    Map entityGitMap = allGitAdditions[entity] ?: [:]
+                    Map entityRes = engineClass.reconcileEntity(
+                        ec, referenceUrl, referenceApiKey, targetUrl, targetApiKey, entity, entityGitMap, entityPkOrigins, autoApply
+                    )
+                    
+                    int crit = (entityRes.criticalMissingList as List).size()
+                    int env = (entityRes.environmentMissingList as List).size()
+                    int applied = (entityRes.autoAppliedCount as Integer)
+
+                    // Strip environment noise from output map so only missing data is returned
+                    entityRes.remove("environmentMissingList")
+                    results.put(entity, entityRes)
+
+                    totalCritical += crit
+                    totalEnv += env
+                    totalApplied += applied
+
+                    if (entityRes.syncXmlPayload) {
+                        fullXml.append(entityRes.syncXmlPayload)
+                    }
+
+                    if (crit > 0) {
+                        tableRows.add([entity: entity, missing: crit, applied: applied])
+                    }
+                }
+
+                // Render clean aligned ASCII table
+                report.append("+------------------------------------------+------------------+--------------+\n")
+                report.append(String.format("| %-40s | %16s | %12s |\n", "Entity Name", "Critical Missing", "Auto-Applied"))
+                report.append("+------------------------------------------+------------------+--------------+\n")
+                if (tableRows) {
+                    for (Map row : tableRows) {
+                        report.append(String.format("| %-40s | %16d | %12d |\n", row.entity, row.missing, row.applied))
+                    }
+                } else {
+                    report.append(String.format("| %-40s | %16d | %12d |\n", "All Target Entities (In Sync)", 0, 0))
+                }
+                report.append("+------------------------------------------+------------------+--------------+\n")
+                report.append(String.format("| %-40s | %16d | %12d |\n", "TOTAL CRITICAL MISSING", totalCritical, totalApplied))
+                report.append("+------------------------------------------+------------------+--------------+\n\n")
+
+                // Add detailed critical missing breakdown with correct Primary Key extraction
+                if (totalCritical > 0) {
+                    report.append("================================================================================\n")
+                    report.append("                       CRITICAL MISSING RECORDS BREAKDOWN                       \n")
+                    report.append("================================================================================\n\n")
+
+                    for (String entity : entities) {
+                        List<Map> critList = results[entity]?.criticalMissingList as List<Map>
+                        if (critList) {
+                            String pkField = engineClass.getPkFieldName(entity)
+                            report.append("[ ${entity} ] (${critList.size()} items missing)\n")
+                            report.append("--------------------------------------------------------------------------------\n")
+                            int itemIdx = 1
+                            for (Map rec : critList) {
+                                String pkVal = rec.get(pkField) ?: rec.get("enumId") ?: rec.get("statusId") ?: rec.get("enumTypeId") ?: rec.get("systemMessageTypeId") ?: rec.get("id")
+                                String typeVal = rec.get("enumTypeId") ?: rec.get("statusTypeId") ?: rec.get("parentTypeId")
+                                String desc = rec.get("description") ?: rec.get("name") ?: ""
+                                String origin = rec.get("_introducedBy") ?: "Git Diff"
+
+                                if (typeVal && !typeVal.isEmpty() && !typeVal.equals(pkVal)) {
+                                    report.append(String.format("  %2d. %s  (Type: %s)\n", itemIdx, pkVal, typeVal))
+                                } else {
+                                    report.append(String.format("  %2d. %s\n", itemIdx, pkVal))
+                                }
+                                if (desc) {
+                                    report.append("      - Description : ${desc}\n")
+                                }
+                                report.append("      - Introduced  : ${origin}\n\n")
+                                itemIdx++
+                            }
+                        }
+                    }
+                }
+
+                // 3. Verify developer omissions (Ghost enums/statuses referenced in code but missing from XML/DB)
+                List<Map<String, Object>> omissions = (List<Map<String, Object>>) codeScannerClass.verifyOmissions(
+                    rawCodeRefs, allGitAdditions, ec, referenceUrl
+                )
+
+                if (omissions) {
+                    report.append("================================================================================\n")
+                    report.append("       DEVELOPER OMISSION ALERTS (Referenced in Code, Missing from Data/DB)     \n")
+                    report.append("================================================================================\n")
+                    report.append("Found ${omissions.size()} references used in code conditions/assignments without seed/upgrade data:\n\n")
+                    int oIdx = 1
+                    for (Map alert : omissions) {
+                        report.append("  ${oIdx}. ${alert.candidateId} (${alert.probableEntity})\n")
+                        report.append("      - Component   : ${alert.component} (${alert.repo})\n")
+                        report.append("      - File        : ${alert.filePath}\n")
+                        report.append("      - Code Line   : ${alert.codeSnippet}\n")
+                        report.append("      - Suggested Fix XML:\n")
+                        report.append("        ${alert.suggestedXml}\n\n")
+                        oIdx++
+                    }
+                }
+
+                if (totalCritical > 0 && omissions.size() > 0) {
+                    overallStatus = "CRITICAL_MISSING_AND_OMISSIONS_FOUND"
+                } else if (totalCritical > 0) {
+                    overallStatus = autoApply ? "AUTO_REPAIRED" : "CRITICAL_MISSING_FOUND"
+                } else if (omissions.size() > 0) {
+                    overallStatus = "DEVELOPER_OMISSION_DETECTED"
+                } else {
+                    overallStatus = "IN_SYNC"
+                }
+
+                report.append("================================================================================\n")
+                report.append("                              RECONCILIATION SUMMARY                            \n")
+                report.append("================================================================================\n")
+                report.append(String.format("  - Total Missing Records to Sync : %d\n", totalCritical))
+                report.append(String.format("  - Total Developer Code Omissions: %d\n", omissions.size()))
+                report.append(String.format("  - Total Auto-Applied to Database: %d\n", totalApplied))
+                report.append(String.format("  - Overall Status                : %s\n", overallStatus))
+                report.append("================================================================================\n")
+
+                totalCriticalMissing = totalCritical
+                totalEnvironmentMissing = totalEnv
+                totalAutoApplied = totalApplied
+                shiftedComponentsCount = shifts.size()
+                totalOmissionAlerts = omissions.size()
+                omissionAlerts = omissions
+                resultsByEntity = results
+                combinedSyncXml = fullXml.length() > 0 ? "<entity-facade-xml>\n${fullXml.toString()}</entity-facade-xml>" : ""
+                summaryReport = report.toString()
+            ]]></script>
+        </actions>
+    </service>
+
+</services>
