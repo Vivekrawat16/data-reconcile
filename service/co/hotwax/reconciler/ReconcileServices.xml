@@ -49,6 +49,12 @@
             <parameter name="repoPath">
                 <description>Optional local path fallback for docker-config</description>
             </parameter>
+            <parameter name="runAutomatedTests" type="Boolean" default="false">
+                <description>If true, actively executes discovered component test suites and dry-run smoke tests</description>
+            </parameter>
+            <parameter name="testComponentList">
+                <description>Optional comma-separated list of component names to filter test suites execution</description>
+            </parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="overallStatus"/>
@@ -61,6 +67,16 @@
             <parameter name="totalServiceBreakingChanges" type="Integer"/>
             <parameter name="serviceBreakingChanges" type="List"/>
             <parameter name="newServicesIntroduced" type="List"/>
+            <parameter name="totalAtRiskScheduledJobs" type="Integer"/>
+            <parameter name="atRiskScheduledJobs" type="List"/>
+            <parameter name="scriptLocationAlerts" type="List"/>
+            <parameter name="totalTestSuitesDiscovered" type="Integer"/>
+            <parameter name="totalTestsDiscovered" type="Integer"/>
+            <parameter name="totalTestsExecuted" type="Integer"/>
+            <parameter name="totalTestsPassed" type="Integer"/>
+            <parameter name="totalTestsFailed" type="Integer"/>
+            <parameter name="testSuiteResults" type="List"/>
+            <parameter name="serviceSmokeTestResults" type="List"/>
             <parameter name="resultsByEntity" type="Map"/>
             <parameter name="combinedSyncXml"/>
             <parameter name="summaryReport"/>
@@ -72,6 +88,8 @@
                 String compPath = ec.factory.getRuntimePath() + "/component/data-reconciler"
                 Class codeScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/CodeReferenceScanner.groovy"))
                 Class serviceScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ServiceContractScanner.groovy"))
+                Class validatorClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ServiceIntegrityValidator.groovy"))
+                Class testRunnerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ComponentTestSuiteRunner.groovy"))
                 Class scannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/GitDiffScanner.groovy"))
                 Class resolverClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/DockerConfigReleaseResolver.groovy"))
                 gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/RemoteInstanceClient.groovy"))
@@ -281,7 +299,107 @@
                     }
                 }
 
-                if (breakingChanges.size() > 0) {
+                // 5. Phase 2: Deep Service Integrity & Scheduled Job Pre-Flight Audit
+                def phase2Result = validatorClass.runAudit(ec, serviceCtx)
+                List<Map<String, Object>> brokenJobs = (List<Map<String, Object>>) phase2Result.brokenScheduledJobAlerts
+                List<Map<String, Object>> scriptAlerts = (List<Map<String, Object>>) phase2Result.scriptLocationAlerts
+
+                if (brokenJobs || scriptAlerts || phase2Result.totalScriptsVerified > 0 || phase2Result.totalScheduledJobsAudited > 0) {
+                    report.append("================================================================================\n")
+                    report.append("               PHASE 2: DEEP SERVICE INTEGRITY & PRE-FLIGHT AUDIT               \n")
+                    report.append("================================================================================\n")
+                    report.append(String.format("  - Service Scripts Verified on Disk : %d\n", phase2Result.totalScriptsVerified))
+                    report.append(String.format("  - Script Location Alerts           : %d\n", scriptAlerts.size()))
+                    report.append(String.format("  - Scheduled Jobs Audited           : %d\n", phase2Result.totalScheduledJobsAudited))
+                    report.append(String.format("  - At-Risk Scheduled Jobs           : %d\n", brokenJobs.size()))
+                    report.append("--------------------------------------------------------------------------------\n\n")
+
+                    if (brokenJobs) {
+                        report.append("[ 🚨 AT-RISK SCHEDULED JOBS (WILL FAIL ON NEXT CRON RUN!) ]\n")
+                        int bjIdx = 1
+                        for (Map bj : brokenJobs) {
+                            report.append(String.format("  %2d. Job Name      : %s (Active, Paused: %s)\n", bjIdx, bj.jobName, bj.paused))
+                            report.append("      - Service       : ${bj.serviceName}\n")
+                            report.append("      - Missing Param : ${bj.missingParam} (required=\"true\")\n")
+                            report.append("      - Component     : ${bj.component}\n")
+                            report.append("      - Impact        : ${bj.message}\n\n")
+                            bjIdx++
+                        }
+                    }
+
+                    if (scriptAlerts) {
+                        report.append("[ ⚠️ SCRIPT LOCATION ALERTS (FILE NOT FOUND ON DISK) ]\n")
+                        int slIdx = 1
+                        for (Map sl : scriptAlerts) {
+                            report.append(String.format("  %2d. Service   : %s (%s)\n", slIdx, sl.serviceName, sl.component))
+                            report.append("      - Location : ${sl.location}\n")
+                            report.append("      - Problem  : ${sl.message}\n\n")
+                            slIdx++
+                        }
+                    }
+                }
+
+                // 6. Phase 3: Automated Test Execution & Smoke Testing
+                def phase3Result = testRunnerClass.runAudit(ec, shifts, serviceCtx, runAutomatedTests == true, testComponentList)
+                List suiteResults = (List) phase3Result.suiteResults
+                List smokeResults = (List) phase3Result.smokeTestResults
+
+                if (phase3Result.totalSuitesDiscovered > 0 || phase3Result.totalSmokeTestsRun > 0) {
+                    report.append("================================================================================\n")
+                    report.append("               PHASE 3: AUTOMATED TEST SUITE RUNNER & SMOKE AUDIT               \n")
+                    report.append("================================================================================\n")
+                    report.append(String.format("  - Test Suites Discovered           : %d\n", phase3Result.totalSuitesDiscovered))
+                    report.append(String.format("  - Total Tests Discovered           : %d\n", phase3Result.totalTestsDiscovered))
+                    report.append(String.format("  - Automated Tests Run              : %d\n", phase3Result.totalTestsExecuted))
+                    report.append(String.format("  - Tests Passed                     : %d\n", phase3Result.totalTestsPassed))
+                    report.append(String.format("  - Tests Failed                     : %d\n", phase3Result.totalTestsFailed))
+                    report.append(String.format("  - Service Smoke Tests Run          : %d\n", phase3Result.totalSmokeTestsRun))
+                    report.append(String.format("  - Smoke Tests Passed               : %d\n", phase3Result.totalSmokeTestsPassed))
+                    report.append(String.format("  - Smoke Tests Failed               : %d\n", phase3Result.totalSmokeTestsFailed))
+                    report.append("--------------------------------------------------------------------------------\n\n")
+
+                    if (suiteResults) {
+                        report.append("[ 🧪 COMPONENT TEST SUITES DISCOVERED ]\n")
+                        int tsIdx = 1
+                        for (def ts : suiteResults) {
+                            report.append(String.format("  %2d. [%s] %s (%s, %d tests)\n", tsIdx, ts.componentName, ts.testClassName, ts.testFramework, ts.totalTests))
+                            report.append("      - Path   : ${ts.relativePath}\n")
+                            report.append("      - Status : ${ts.status}\n")
+                            if (ts.featureNames) {
+                                report.append("      - Features: ${ts.featureNames.take(3).join(', ')}${ts.featureNames.size() > 3 ? ' ... (' + (ts.featureNames.size() - 3) + ' more)' : ''}\n")
+                            }
+                            if (ts.failureDetails) {
+                                for (Map fd : ts.failureDetails) {
+                                    report.append("      - ERROR: ${fd.error}: ${fd.message}\n")
+                                }
+                            }
+                            report.append("\n")
+                            tsIdx++
+                        }
+                    }
+
+                    if (smokeResults) {
+                        report.append("[ 💨 SERVICE DRY-RUN SMOKE TESTS ]\n")
+                        int smIdx = 1
+                        for (Map sm : smokeResults) {
+                            report.append(String.format("  %2d. %s (%s) -> %s\n", smIdx, sm.serviceName, sm.component, sm.status))
+                            report.append("      - Details: ${sm.message}\n")
+                            if (sm.durationMs) {
+                                report.append("      - Duration: ${sm.durationMs}ms\n")
+                            }
+                            report.append("\n")
+                            smIdx++
+                        }
+                    }
+                }
+
+                if (brokenJobs.size() > 0) {
+                    overallStatus = "CRITICAL_SCHEDULED_JOBS_AT_RISK"
+                } else if (phase3Result.totalTestsFailed > 0 || phase3Result.totalSmokeTestsFailed > 0) {
+                    overallStatus = "AUTOMATED_TESTS_FAILED"
+                } else if (scriptAlerts.size() > 0) {
+                    overallStatus = "SERVICE_SCRIPTS_MISSING"
+                } else if (breakingChanges.size() > 0) {
                     overallStatus = "BREAKING_SERVICE_CHANGES_FOUND"
                 } else if (totalCritical > 0 && omissions.size() > 0) {
                     overallStatus = "CRITICAL_MISSING_AND_OMISSIONS_FOUND"
@@ -299,6 +417,9 @@
                 report.append(String.format("  - Total Missing Records to Sync : %d\n", totalCritical))
                 report.append(String.format("  - Total Developer Code Omissions: %d\n", omissions.size()))
                 report.append(String.format("  - Service Breaking Changes      : %d\n", breakingChanges.size()))
+                report.append(String.format("  - At-Risk Scheduled Jobs        : %d\n", brokenJobs.size()))
+                report.append(String.format("  - Test Suites Discovered        : %d\n", phase3Result.totalSuitesDiscovered))
+                report.append(String.format("  - Automated Tests Executed      : %d (Passed: %d, Failed: %d)\n", phase3Result.totalTestsExecuted, phase3Result.totalTestsPassed, phase3Result.totalTestsFailed))
                 report.append(String.format("  - Total Auto-Applied to Database: %d\n", totalApplied))
                 report.append(String.format("  - Overall Status                : %s\n", overallStatus))
                 report.append("================================================================================\n")
@@ -312,6 +433,16 @@
                 totalServiceBreakingChanges = breakingChanges.size()
                 serviceBreakingChanges = breakingChanges
                 newServicesIntroduced = newServices
+                totalAtRiskScheduledJobs = brokenJobs.size()
+                atRiskScheduledJobs = brokenJobs
+                scriptLocationAlerts = scriptAlerts
+                totalTestSuitesDiscovered = phase3Result.totalSuitesDiscovered
+                totalTestsDiscovered = phase3Result.totalTestsDiscovered
+                totalTestsExecuted = phase3Result.totalTestsExecuted
+                totalTestsPassed = phase3Result.totalTestsPassed
+                totalTestsFailed = phase3Result.totalTestsFailed
+                testSuiteResults = suiteResults
+                serviceSmokeTestResults = smokeResults
                 resultsByEntity = results
                 combinedSyncXml = fullXml.length() > 0 ? "<entity-facade-xml>\n${fullXml.toString()}</entity-facade-xml>" : ""
                 summaryReport = report.toString()

@@ -173,3 +173,39 @@ Whenever services in Moqui are updated between release tags:
 3. **Detects Deleted/Renamed Services:** Flags services removed from XML files.
 4. **New Services Catalog:** Catalogs all newly introduced services with their implementation type (`inline`, `script`, `oms-rest`, etc.).
 5. **Pre-flight Definition Verification:** Uses Moqui's Service Facade to verify that every new or modified service compiles and loads without error.
+
+---
+
+## 🔬 8. Deep Service Integrity & Scheduled Job Pre-Flight Audit (Phase 2)
+
+Phase 2 builds upon the Service Contract Scanner by analyzing deep runtime linkages and scheduled job compatibility:
+
+1. **Scheduled Job Crash Pre-Flight Check:**
+   - Queries `moqui.service.job.ServiceJob` and `moqui.service.job.ServiceJobParameter` in the database.
+   - Cross-references all active scheduled jobs against services that introduced new `required="true"` parameters in the incoming release tag.
+   - Flags any active job missing the new required parameter with a **`CRITICAL`** alert before cron trigger, preventing production job failures and outages.
+2. **Disk & Component Script Verification:**
+   - For services using `location="component://..."` or `location="file://..."`, resolves the path via Moqui's `ec.resource.getLocationReference(loc)`.
+   - Verifies whether the referenced script file actually exists on the filesystem, catching missing `.groovy` or `.xml` script files before execution.
+3. **Escalated Audit Status:**
+   - Automatically escalates the release health status to `CRITICAL_SCHEDULED_JOBS_AT_RISK` if any active cron job is in danger of failing.
+
+---
+
+## 🧪 9. Automated Test Suite Runner & Smoke Audit (Phase 3)
+
+Phase 3 provides end-to-end automated test verification and service dry-run execution:
+
+1. **Component Test Suite Discovery:**
+   - Automatically scans all shifted components for Spock specifications (`*Spec.groovy`), JUnit test suites (`*Test*.groovy`, `*Test*.java`), and Moqui XML test cases.
+   - Extracts test methods, features, and test counts.
+   - Verifies test class compilation and imports in Moqui's `GroovyClassLoader` to catch compile-time breakage before running.
+2. **Non-Destructive Service Smoke Tests (Dry-Run):**
+   - For newly introduced services, tests invocation readiness.
+   - If a service requires no mandatory parameters, executes a dry-run invocation within an isolated transaction that is immediately rolled back (0 persistent side-effects or dirty data in DB).
+   - If a service requires mandatory parameters, verifies definition and parameter schema completeness.
+3. **Execution Controls:**
+   - `runAutomatedTests` (Boolean, default: `false`): When set to `true`, actively runs test suites and smoke tests.
+   - `testComponentList` (String, optional): Filter specific components (e.g., `mantle-shopify-connector,oms`).
+4. **Automated Health Status:**
+   - Emits `AUTOMATED_TESTS_FAILED` if any test suite fails or throws a compilation error.
