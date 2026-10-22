@@ -1,176 +1,279 @@
 package co.hotwax.reconciler
 
+import groovy.json.JsonSlurper
+import org.apache.commons.csv.CSVFormat
+import org.apache.commons.csv.CSVParser
+import org.apache.commons.csv.CSVRecord
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import groovy.json.JsonSlurper
+
 import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.URI
 import java.net.URL
-import java.net.Proxy
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 
 /**
- * RemoteInstanceClient
- * Connects to a reference Moqui/HotWax instance via HTTP REST APIs,
- * retrieves entity datasets, and returns standardized record maps.
+ * Bounded, fail-closed HTTP client for reference and target Moqui instances.
  */
 class RemoteInstanceClient {
     private static final Logger logger = LoggerFactory.getLogger(RemoteInstanceClient.class)
+    private static final int MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+    private static final int MAX_ERROR_BYTES = 32 * 1024
 
-    /**
-     * Fetches entity records from a remote Moqui instance.
-     * @param baseUrl Base URL of the reference instance (e.g. https://rails-uat.hotwax.io or https://krewe-maarg-uat.hotwax.io)
-     * @param apiKey Optional Bearer token or Cookie string
-     * @param entityName Full Moqui entity name
-     * @return List of record maps
-     */
-    static List<Map<String, Object>> fetchRemoteEntity(String baseUrl, String apiKey, String entityName) {
-        if (!baseUrl) {
-            logger.warn("RemoteInstanceClient: Reference URL is empty, skipping remote fetch for ${entityName}")
-            return []
-        }
-
-        String cleanUrl = baseUrl.trim().replaceAll("/+\$", "")
-        if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-            cleanUrl = "https://" + cleanUrl
-        }
-
+    static class FetchResult {
+        boolean success
         List<Map<String, Object>> records = []
-
-        try {
-            if (entityName == "moqui.basic.Enumeration") {
-                // High-speed endpoint for Enums
-                String endpoint = "${cleanUrl}/rest/s1/admin/enums?pageNoLimit=true"
-                HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection(Proxy.NO_PROXY)
-                conn.setRequestMethod("GET")
-                conn.setRequestProperty("Accept", "application/json")
-                conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler")
-                if (apiKey) {
-                    if (apiKey.startsWith("Bearer ") || apiKey.startsWith("bearer ")) {
-                        conn.setRequestProperty("Authorization", apiKey)
-                    } else if (apiKey.contains("=") || apiKey.contains(";")) {
-                        conn.setRequestProperty("Cookie", apiKey)
-                    } else {
-                        conn.setRequestProperty("Authorization", "Bearer " + apiKey)
-                    }
-                }
-                conn.setConnectTimeout(15000)
-                conn.setReadTimeout(60000)
-
-                int responseCode = conn.getResponseCode()
-                if (responseCode >= 200 && responseCode < 300) {
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))
-                    StringBuilder sb = new StringBuilder()
-                    String line
-                    while ((line = reader.readLine()) != null) sb.append(line)
-                    reader.close()
-
-                    def json = new JsonSlurper().parseText(sb.toString())
-                    if (json instanceof List) {
-                        records = (List<Map<String, Object>>) json
-                    } else if (json instanceof Map && json.containsKey("itemList")) {
-                        records = (List<Map<String, Object>>) json.get("itemList")
-                    }
-                } else {
-                    logger.warn("RemoteInstanceClient: HTTP ${responseCode} fetching ${entityName} from ${endpoint}")
-                }
-            } else {
-                // Fallback to DataExport endpoint for other Moqui entities
-                String endpoint = "${cleanUrl}/apps/tools/Entity/DataExport/EntityExport"
-                HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection(Proxy.NO_PROXY)
-                conn.setRequestMethod("POST")
-                conn.setDoOutput(true)
-                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-                conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler")
-                if (apiKey) {
-                    if (apiKey.contains("=") || apiKey.contains(";")) {
-                        conn.setRequestProperty("Cookie", apiKey)
-                    } else {
-                        conn.setRequestProperty("Authorization", "Bearer " + apiKey)
-                    }
-                }
-                conn.setConnectTimeout(15000)
-                conn.setReadTimeout(60000)
-
-                String postData = "entityNames=${URLEncoder.encode(entityName, 'UTF-8')}&fileType=CSV&output=browser&dependentLevels=0&useTableColumnNames=No&filterMap=%5B%3A%5D"
-                conn.getOutputStream().write(postData.getBytes("UTF-8"))
-
-                int responseCode = conn.getResponseCode()
-                if (responseCode >= 200 && responseCode < 300) {
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))
-                    List<String> lines = []
-                    String line
-                    while ((line = reader.readLine()) != null) lines.add(line)
-                    reader.close()
-
-                    if (lines.size() >= 2) {
-                        // Header is at line 2 (line 1 is Moqui metadata)
-                        String[] headers = lines.get(1).split(",")
-                        for (int i = 2; i < lines.size(); i++) {
-                            String[] values = lines.get(i).split(",")
-                            Map<String, Object> row = [:]
-                            for (int c = 0; c < headers.length && c < values.length; c++) {
-                                String col = headers[c].trim().replaceAll("^\"|\"\$", "")
-                                String val = values[c].trim().replaceAll("^\"|\"\$", "")
-                                row.put(col, val)
-                            }
-                            if (!row.isEmpty()) records.add(row)
-                        }
-                    }
-                } else {
-                    logger.warn("RemoteInstanceClient: HTTP ${responseCode} fetching ${entityName} from ${endpoint}")
-                }
-            }
-        } catch (java.net.UnknownHostException uhe) {
-            logger.error("RemoteInstanceClient: Unable to resolve host '${uhe.message}'. Please check that Reference URL is a valid domain (e.g. https://rails-uat.hotwax.io or https://krewe-maarg-uat.hotwax.io).")
-        } catch (Exception e) {
-            logger.error("Error fetching remote data for ${entityName} from ${baseUrl}: ${e.message}", e)
-        }
-
-        return records
+        Integer statusCode
+        String endpoint
+        String error
     }
 
-    /**
-     * Uploads/imports an entity XML payload to a remote Moqui instance.
-     */
-    static int uploadRemoteXml(String baseUrl, String apiKey, String xmlPayload) {
-        if (!baseUrl || !xmlPayload?.trim()) return 0
+    static class UploadResult {
+        boolean success
+        Integer statusCode
+        String endpoint
+        String error
+        String responseBody
+    }
 
-        String cleanUrl = baseUrl.trim().replaceAll("/+\$", "")
-        if (!cleanUrl.startsWith("http://") && !cleanUrl.startsWith("https://")) {
-            cleanUrl = "https://" + cleanUrl
-        }
-
+    static FetchResult fetchRemoteEntityResult(String baseUrl, String apiKey, String entityName) {
+        FetchResult result = new FetchResult()
+        HttpURLConnection conn = null
         try {
-            String endpoint = "${cleanUrl}/apps/tools/Entity/DataImport/load"
-            HttpURLConnection conn = (HttpURLConnection) new URL(endpoint).openConnection(Proxy.NO_PROXY)
-            conn.setRequestMethod("POST")
-            conn.setDoOutput(true)
-            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-            conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler")
-            if (apiKey) {
-                if (apiKey.contains("=") || apiKey.contains(";")) {
-                    conn.setRequestProperty("Cookie", apiKey)
-                } else {
-                    conn.setRequestProperty("Authorization", "Bearer " + apiKey)
-                }
-            }
-            conn.setConnectTimeout(30000)
-            conn.setReadTimeout(120000)
+            URL base = validateRemoteBaseUrl(baseUrl)
+            boolean enumeration = entityName == "moqui.basic.Enumeration"
+            String endpoint = enumeration ?
+                    "${base.toExternalForm()}/rest/s1/admin/enums?pageNoLimit=true" :
+                    "${base.toExternalForm()}/apps/tools/Entity/DataExport/EntityExport"
+            result.endpoint = endpoint
 
-            String postData = "xmlText=" + URLEncoder.encode("<entity-facade-xml>\n" + xmlPayload + "\n</entity-facade-xml>", "UTF-8")
-            conn.getOutputStream().write(postData.getBytes("UTF-8"))
-
-            int responseCode = conn.getResponseCode()
-            if (responseCode >= 200 && responseCode < 400) {
-                logger.info("RemoteInstanceClient: Successfully uploaded XML payload to ${endpoint}")
-                return 1
-            } else {
-                logger.warn("RemoteInstanceClient: Failed uploading XML to ${endpoint}, HTTP ${responseCode}")
+            conn = openConnection(new URL(endpoint), enumeration ? "GET" : "POST", apiKey)
+            if (!enumeration) {
+                conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                byte[] payload = ("entityNames=" + URLEncoder.encode(entityName, StandardCharsets.UTF_8.name()) +
+                        "&fileType=CSV&output=browser&dependentLevels=0&useTableColumnNames=No&filterMap=%5B%3A%5D")
+                        .getBytes(StandardCharsets.UTF_8)
+                conn.setFixedLengthStreamingMode(payload.length)
+                conn.outputStream.withCloseable { it.write(payload) }
             }
+
+            int status = conn.responseCode
+            result.statusCode = status
+            if (status < 200 || status >= 300) {
+                result.error = "HTTP ${status} fetching ${entityName}: " + readResponse(conn.errorStream, MAX_ERROR_BYTES)
+                return result
+            }
+
+            String body = readResponse(conn.inputStream, MAX_RESPONSE_BYTES)
+            if (!body?.trim()) {
+                result.error = "Empty response fetching ${entityName}"
+                return result
+            }
+            if (looksLikeHtml(body)) {
+                result.error = "Unexpected HTML response fetching ${entityName}; authentication or endpoint configuration may be invalid"
+                return result
+            }
+
+            result.records = enumeration ? parseJsonRecords(body) : parseMoquiCsv(body)
+            result.success = true
+            return result
         } catch (Exception e) {
-            logger.error("RemoteInstanceClient: Error uploading XML to ${baseUrl}: ${e.message}", e)
+            result.error = "${e.class.simpleName}: ${e.message}"
+            logger.warn("Remote entity fetch failed for ${entityName}: ${result.error}")
+            return result
+        } finally {
+            conn?.disconnect()
         }
-        return 0
+    }
+
+    /** Compatibility wrapper. New callers should inspect FetchResult.success. */
+    static List<Map<String, Object>> fetchRemoteEntity(String baseUrl, String apiKey, String entityName) {
+        FetchResult result = fetchRemoteEntityResult(baseUrl, apiKey, entityName)
+        return result.success ? result.records : []
+    }
+
+    static UploadResult uploadRemoteXmlResult(String baseUrl, String apiKey, String xmlPayload) {
+        UploadResult result = new UploadResult()
+        if (!xmlPayload?.trim()) {
+            result.error = "XML payload is empty"
+            return result
+        }
+
+        HttpURLConnection conn = null
+        try {
+            URL base = validateRemoteBaseUrl(baseUrl)
+            String endpoint = "${base.toExternalForm()}/apps/tools/Entity/DataImport/load"
+            result.endpoint = endpoint
+            conn = openConnection(new URL(endpoint), "POST", apiKey)
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+
+            String wrappedXml = "<entity-facade-xml>\n${xmlPayload}\n</entity-facade-xml>"
+            String form = "onlyCreate=true&xmlText=" + URLEncoder.encode(wrappedXml, StandardCharsets.UTF_8.name())
+            byte[] payload = form.getBytes(StandardCharsets.UTF_8)
+            conn.setFixedLengthStreamingMode(payload.length)
+            conn.outputStream.withCloseable { it.write(payload) }
+
+            int status = conn.responseCode
+            result.statusCode = status
+            String body = readResponse(status >= 200 && status < 300 ? conn.inputStream : conn.errorStream,
+                    status >= 200 && status < 300 ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES)
+            result.responseBody = body
+            if (status < 200 || status >= 300) {
+                result.error = "HTTP ${status} importing create-only XML: ${body}"
+                return result
+            }
+            if (looksLikeHtml(body) || containsImportError(body)) {
+                result.error = "Remote import returned an error or unexpected response: ${abbreviate(body, 1000)}"
+                return result
+            }
+            result.success = true
+            return result
+        } catch (Exception e) {
+            result.error = "${e.class.simpleName}: ${e.message}"
+            logger.warn("Remote create-only XML import failed: ${result.error}")
+            return result
+        } finally {
+            conn?.disconnect()
+        }
+    }
+
+    /** Compatibility wrapper. */
+    static int uploadRemoteXml(String baseUrl, String apiKey, String xmlPayload) {
+        return uploadRemoteXmlResult(baseUrl, apiKey, xmlPayload).success ? 1 : 0
+    }
+
+    static List<Map<String, Object>> parseMoquiCsv(String body) {
+        int firstLineEnd = body.indexOf('\n')
+        if (firstLineEnd < 0) throw new IllegalArgumentException("Moqui CSV response has no header row")
+        String csvText = body.substring(firstLineEnd + 1)
+        CSVFormat format = CSVFormat.DEFAULT.builder()
+                .setHeader()
+                .setSkipHeaderRecord(true)
+                .setIgnoreEmptyLines(true)
+                .get()
+        CSVParser parser = format.parse(new StringReader(csvText))
+        try {
+            List<Map<String, Object>> records = []
+            for (CSVRecord record : parser) {
+                Map<String, Object> row = new LinkedHashMap<>()
+                record.toMap().each { String key, String value -> row.put(key?.trim(), value) }
+                if (!row.isEmpty()) records.add(row)
+            }
+            return records
+        } finally {
+            parser.close()
+        }
+    }
+
+    static Map<String, String> authenticationHeaders(String apiKey) {
+        Map<String, String> headers = [:]
+        String value = apiKey?.trim()
+        if (!value) return headers
+
+        if (value.regionMatches(true, 0, "Bearer ", 0, 7)) {
+            headers.Authorization = "Bearer " + value.substring(7).trim()
+        } else if (value.regionMatches(true, 0, "Cookie ", 0, 7)) {
+            headers.Cookie = value.substring(7).trim()
+        } else if (value.contains("=") || value.contains(";")) {
+            headers.Cookie = value
+        } else {
+            headers.Authorization = "Bearer " + value
+        }
+        return headers
+    }
+
+    private static HttpURLConnection openConnection(URL url, String method, String apiKey) {
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection()
+        conn.instanceFollowRedirects = false
+        conn.requestMethod = method
+        conn.doOutput = method == "POST"
+        conn.setRequestProperty("Accept", "application/json, text/csv, text/plain")
+        conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler/2.0")
+        authenticationHeaders(apiKey).each { String name, String value -> conn.setRequestProperty(name, value) }
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 60_000
+        return conn
+    }
+
+    static URL validateRemoteBaseUrl(String baseUrl) {
+        if (!baseUrl?.trim()) throw new IllegalArgumentException("Remote base URL is required")
+        String normalized = baseUrl.trim().replaceAll('/+$', '')
+        URI uri = new URI(normalized)
+        if (!"https".equalsIgnoreCase(uri.scheme)) {
+            throw new IllegalArgumentException("Only HTTPS remote instance URLs are allowed")
+        }
+        if (!uri.host || uri.userInfo || uri.query || uri.fragment) {
+            throw new IllegalArgumentException("Remote base URL must contain only an HTTPS scheme, host, optional port, and base path")
+        }
+        if (!isAllowedHost(uri.host)) {
+            throw new SecurityException("Remote host [${uri.host}] is not in data.reconciler.allowedHosts")
+        }
+
+        for (InetAddress address : InetAddress.getAllByName(uri.host)) {
+            if (isPrivateAddress(address)) {
+                throw new SecurityException("Remote host [${uri.host}] resolves to a private or local address")
+            }
+        }
+        return uri.toURL()
+    }
+
+    private static boolean isAllowedHost(String host) {
+        String configured = System.getProperty("data.reconciler.allowedHosts")?.trim()
+        if (!configured) return true
+        String normalized = host.toLowerCase(Locale.ROOT)
+        return configured.split(",").collect { it.trim().toLowerCase(Locale.ROOT) }.find { String allowed ->
+            allowed && (normalized == allowed || (allowed.startsWith("*.") && normalized.endsWith(allowed.substring(1))))
+        } != null
+    }
+
+    private static boolean isPrivateAddress(InetAddress address) {
+        if (address.anyLocalAddress || address.loopbackAddress || address.linkLocalAddress ||
+                address.siteLocalAddress || address.multicastAddress) return true
+        byte[] raw = address.address
+        if (raw.length == 16 && ((raw[0] & 0xFE) == 0xFC)) return true
+        return false
+    }
+
+    private static List<Map<String, Object>> parseJsonRecords(String body) {
+        Object json = new JsonSlurper().parseText(body)
+        if (json instanceof List) return (List<Map<String, Object>>) json
+        if (json instanceof Map && json.itemList instanceof List) {
+            return (List<Map<String, Object>>) json.itemList
+        }
+        throw new IllegalArgumentException("JSON response does not contain a record list")
+    }
+
+    private static String readResponse(InputStream stream, int maxBytes) {
+        if (stream == null) return ""
+        ByteArrayOutputStream output = new ByteArrayOutputStream()
+        byte[] buffer = new byte[8192]
+        int total = 0
+        stream.withCloseable {
+            int read
+            while ((read = it.read(buffer)) >= 0) {
+                total += read
+                if (total > maxBytes) throw new IOException("Response exceeds ${maxBytes} bytes")
+                output.write(buffer, 0, read)
+            }
+        }
+        return output.toString(StandardCharsets.UTF_8.name())
+    }
+
+    private static boolean looksLikeHtml(String body) {
+        String trimmed = body?.trim()?.toLowerCase(Locale.ROOT)
+        return trimmed?.startsWith("<!doctype html") || trimmed?.startsWith("<html")
+    }
+
+    private static boolean containsImportError(String body) {
+        String lower = body?.toLowerCase(Locale.ROOT) ?: ""
+        return lower.contains('"error"') || lower.contains("errormessage") ||
+                lower.contains("validation error") || lower.contains("exception")
+    }
+
+    private static String abbreviate(String value, int max) {
+        if (value == null || value.length() <= max) return value
+        return value.substring(0, max) + "..."
     }
 }

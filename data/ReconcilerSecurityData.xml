@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<entity-facade-xml type="ext-seed">
+    <moqui.security.UserPermission userPermissionId="DATA_RECONCILE_ADMIN"
+            description="Run release metadata reconciliation and explicitly enabled create-only repairs"/>
+    <moqui.security.UserGroupPermission userGroupId="ADMIN" userPermissionId="DATA_RECONCILE_ADMIN" fromDate="0"/>
+</entity-facade-xml>

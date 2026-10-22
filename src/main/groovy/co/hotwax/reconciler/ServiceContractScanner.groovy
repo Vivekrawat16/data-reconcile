@@ -1,226 +1,228 @@
 package co.hotwax.reconciler
 
+import org.moqui.context.ExecutionContext
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
 import java.util.regex.Matcher
 import java.util.regex.Pattern
-import org.moqui.context.ExecutionContext
 
 /**
- * ServiceContractScanner (Phase 1)
- * Scans release git diffs across shifted components for Moqui service XML files (service/** /*.xml).
- * Detects:
- * 1. Breaking In-Parameter Changes: Existing services adding new required="true" parameters.
- * 2. Removed In/Out Parameters from existing services.
- * 3. Deleted or Renamed Services.
- * 4. New Services introduced in the release.
- * 5. Pre-flight Definition & Syntax Verification via Moqui's Service Facade.
+ * Tracks service contract changes using full Moqui service names and explicit unresolved diff findings.
  */
 class ServiceContractScanner {
     private static final Logger logger = LoggerFactory.getLogger(ServiceContractScanner.class)
-
-    private static final Pattern PATTERN_SERVICE = Pattern.compile(/^[+ \-]?\s*<service\s+([^>]+)>/)
-    private static final Pattern PATTERN_PARAM = Pattern.compile(/^[+ \-]\s*<parameter\s+([^>]+)>/)
-    private static final Pattern PATTERN_ATTR = Pattern.compile(/([a-zA-Z0-9_\-]+)="([^"]*)"/)
+    private static final Pattern SERVICE_PATTERN = Pattern.compile(/^[+ \-]?\s*<service\s+([^>]+)>/)
+    private static final Pattern PARAM_PATTERN = Pattern.compile(/^[+ \-]\s*<parameter\s+([^>]+)>/)
+    private static final Pattern ATTR_PATTERN = Pattern.compile(/([a-zA-Z0-9_-]+)\s*=\s*(["'])(.*?)\2/)
 
     static class ServiceDiffContext {
         String currentFile = ""
         String repo = ""
         String component = ""
         String tagShift = ""
-        String currentServiceName = null
-        String currentServiceVerb = null
-        String currentServiceNoun = null
-        boolean isNewService = false
-        boolean inInParams = false
-        boolean inOutParams = false
+        String currentServiceName
+        String currentSection
+
+        Map<String, Map<String, Object>> addedDeclarations = [:]
+        Map<String, Map<String, Object>> removedDeclarations = [:]
+        List<Map<String, Object>> parameterChanges = []
+        List<Map<String, Object>> unresolvedChanges = []
 
         List<Map<String, Object>> breakingChanges = []
         List<Map<String, Object>> newServices = []
         List<Map<String, Object>> deletedServices = []
         List<Map<String, Object>> modifiedServices = []
         Map<String, Map<String, Object>> serviceCatalog = [:]
+        boolean finalized = false
     }
 
-    /**
-     * Creates a new scanning context.
-     */
-    static ServiceDiffContext createContext() {
-        return new ServiceDiffContext()
-    }
+    static ServiceDiffContext createContext() { new ServiceDiffContext() }
 
-    /**
-     * Processes a single diff line from a service XML file.
-     */
-    static void processLine(String line, String filePath, String repo, String component, String tagShift, ServiceDiffContext ctx) {
-        if (!line || !filePath) return
+    static void processLine(
+            String line, String filePath, String repo, String component, String tagShift,
+            ServiceDiffContext context) {
+        if (!line || !filePath || context == null) return
+        context.finalized = false
 
-        if (ctx.currentFile != filePath) {
-            ctx.currentFile = filePath
-            ctx.repo = repo
-            ctx.component = component
-            ctx.tagShift = tagShift
-            ctx.currentServiceName = null
-            ctx.isNewService = false
-            ctx.inInParams = false
-            ctx.inOutParams = false
+        if (context.currentFile != filePath) {
+            context.currentFile = filePath
+            context.currentServiceName = null
+            context.currentSection = null
         }
+        context.repo = repo
+        context.component = component
+        context.tagShift = tagShift
 
-        // 1. Detect <service ...> declaration
-        Matcher sm = PATTERN_SERVICE.matcher(line)
-        if (sm.find()) {
-            Map<String, String> attrs = parseAttributes(sm.group(1))
-            String verb = attrs.get("verb") ?: ""
-            String noun = attrs.get("noun") ?: ""
-            String serviceName = verb && noun ? "${verb}#${noun}" : (noun ?: verb)
-
-            ctx.currentServiceVerb = verb
-            ctx.currentServiceNoun = noun
-            ctx.currentServiceName = serviceName
-            ctx.isNewService = line.startsWith("+")
-            ctx.inInParams = false
-            ctx.inOutParams = false
-
-            if (line.startsWith("-") && !line.startsWith("---")) {
-                ctx.deletedServices.add([
-                    serviceName: serviceName,
-                    component: component,
-                    repo: repo,
-                    filePath: filePath,
-                    tagShift: tagShift
-                ])
-            } else if (line.startsWith("+") && !line.startsWith("+++")) {
-                if (!ctx.serviceCatalog.containsKey(serviceName)) {
-                    Map<String, Object> newSvc = [
-                        serviceName: serviceName,
-                        verb: verb,
-                        noun: noun,
-                        component: component,
-                        repo: repo,
-                        filePath: filePath,
-                        tagShift: tagShift,
-                        type: attrs.get("type") ?: "inline",
-                        location: attrs.get("location") ?: ""
-                    ]
-                    ctx.newServices.add(newSvc)
-                    ctx.serviceCatalog.put(serviceName, newSvc)
-                }
-            } else {
-                // Existing service modified
-                if (!ctx.serviceCatalog.containsKey(serviceName)) {
-                    ctx.serviceCatalog.put(serviceName, [
-                        serviceName: serviceName,
-                        verb: verb,
-                        noun: noun,
-                        component: component,
-                        repo: repo,
-                        filePath: filePath,
-                        tagShift: tagShift
-                    ])
-                }
-            }
+        if (line.startsWith("@@")) {
+            context.currentServiceName = null
+            context.currentSection = null
             return
         }
 
-        // 2. Track parameter blocks
+        Matcher serviceMatcher = SERVICE_PATTERN.matcher(line)
+        if (serviceMatcher.find()) {
+            Map<String, String> attrs = parseAttributes(serviceMatcher.group(1))
+            String verb = attrs.verb ?: ""
+            String noun = attrs.noun ?: ""
+            String fullName = buildFullServiceName(filePath, verb, noun)
+            context.currentServiceName = fullName
+            context.currentSection = null
+            Map<String, Object> declaration = [
+                    serviceName: fullName, verb: verb, noun: noun, component: component,
+                    repo: repo, filePath: filePath, tagShift: tagShift,
+                    type: attrs.type ?: "inline", location: attrs.location ?: ""
+            ]
+            if (isAdded(line)) context.addedDeclarations.put(fullName, declaration)
+            else if (isRemoved(line)) context.removedDeclarations.put(fullName, declaration)
+            else context.serviceCatalog.put(fullName, declaration)
+            return
+        }
+
         if (line.contains("<in-parameters>")) {
-            ctx.inInParams = true
-            ctx.inOutParams = false
+            context.currentSection = "IN"
             return
         }
         if (line.contains("</in-parameters>")) {
-            ctx.inInParams = false
+            context.currentSection = null
             return
         }
         if (line.contains("<out-parameters>")) {
-            ctx.inOutParams = true
-            ctx.inInParams = false
+            context.currentSection = "OUT"
             return
         }
         if (line.contains("</out-parameters>")) {
-            ctx.inOutParams = false
+            context.currentSection = null
             return
         }
 
-        // 3. Inspect parameters inside <in-parameters> or <out-parameters>
-        if ((ctx.inInParams || ctx.inOutParams) && ctx.currentServiceName) {
-            boolean isAdded = line.startsWith("+") && !line.startsWith("++")
-            boolean isRemoved = line.startsWith("-") && !line.startsWith("--")
+        if (!isAdded(line) && !isRemoved(line)) return
+        Matcher parameterMatcher = PARAM_PATTERN.matcher(line)
+        if (!parameterMatcher.find()) return
 
-            if (isAdded || isRemoved) {
-                Matcher pm = PATTERN_PARAM.matcher(line)
-                if (pm.find()) {
-                    Map<String, String> pAttrs = parseAttributes(pm.group(1))
-                    String paramName = pAttrs.get("name")
-                    boolean isRequired = "true".equalsIgnoreCase(pAttrs.get("required"))
-                    String paramType = pAttrs.get("type") ?: "String"
+        if (!context.currentServiceName || !context.currentSection) {
+            context.unresolvedChanges.add([
+                    filePath: filePath, line: line.trim(), repo: repo, component: component,
+                    reason: "Parameter change lacks service or in/out parameter context in the unified diff hunk"
+            ])
+            return
+        }
 
-                    if (isAdded && ctx.inInParams) {
-                        // If added to an EXISTING service and required="true" -> CRITICAL BREAKING CHANGE!
-                        if (!ctx.isNewService && isRequired) {
-                            ctx.breakingChanges.add([
-                                serviceName: ctx.currentServiceName,
-                                paramName: paramName,
-                                changeType: "NEW_REQUIRED_IN_PARAM",
-                                severity: "CRITICAL",
-                                paramType: paramType,
-                                component: ctx.component,
-                                repo: ctx.repo,
-                                filePath: ctx.filePath,
-                                tagShift: ctx.tagShift,
-                                message: "Added mandatory in-parameter [${paramName}] to existing service. Existing callers will FAIL!"
-                            ])
-                        }
-                    } else if (isRemoved) {
-                        // Parameter deleted from an existing service
-                        if (!ctx.isNewService) {
-                            ctx.breakingChanges.add([
-                                serviceName: ctx.currentServiceName,
-                                paramName: paramName,
-                                changeType: ctx.inInParams ? "REMOVED_IN_PARAM" : "REMOVED_OUT_PARAM",
-                                severity: "HIGH",
-                                paramType: paramType,
-                                component: ctx.component,
-                                repo: ctx.repo,
-                                filePath: ctx.filePath,
-                                tagShift: ctx.tagShift,
-                                message: "${ctx.inInParams ? 'In-parameter' : 'Out-parameter'} [${paramName}] was removed from existing service."
-                            ])
-                        }
-                    }
-                }
+        Map<String, String> attrs = parseAttributes(parameterMatcher.group(1))
+        context.parameterChanges.add([
+                serviceName: context.currentServiceName,
+                section: context.currentSection,
+                direction: isAdded(line) ? "ADDED" : "REMOVED",
+                paramName: attrs.name,
+                required: "true".equalsIgnoreCase(attrs.required),
+                paramType: attrs.type ?: "String",
+                component: component,
+                repo: repo,
+                filePath: filePath,
+                tagShift: tagShift
+        ])
+    }
+
+    static void finalizeContext(ServiceDiffContext context) {
+        if (context == null || context.finalized) return
+        context.breakingChanges.clear()
+        context.newServices.clear()
+        context.deletedServices.clear()
+        context.modifiedServices.clear()
+
+        Set<String> addedNames = context.addedDeclarations.keySet()
+        Set<String> removedNames = context.removedDeclarations.keySet()
+        Set<String> newNames = new LinkedHashSet<>(addedNames)
+        newNames.removeAll(removedNames)
+        Set<String> deletedNames = new LinkedHashSet<>(removedNames)
+        deletedNames.removeAll(addedNames)
+        Set<String> modifiedNames = new LinkedHashSet<>(addedNames)
+        modifiedNames.retainAll(removedNames)
+
+        newNames.each { String name ->
+            Map<String, Object> value = context.addedDeclarations.get(name)
+            context.newServices.add(value)
+            context.serviceCatalog.put(name, value)
+        }
+        deletedNames.each { String name -> context.deletedServices.add(context.removedDeclarations.get(name)) }
+        modifiedNames.each { String name ->
+            Map<String, Object> value = context.addedDeclarations.get(name)
+            context.modifiedServices.add(value)
+            context.serviceCatalog.put(name, value)
+        }
+
+        Map<String, List<Map<String, Object>>> grouped = context.parameterChanges.groupBy {
+            "${it.serviceName}::${it.section}::${it.paramName}"
+        }
+        grouped.each { String ignored, List<Map<String, Object>> changes ->
+            Map<String, Object> added = changes.find { it.direction == "ADDED" }
+            Map<String, Object> removed = changes.find { it.direction == "REMOVED" }
+            String serviceName = (added ?: removed).serviceName
+            if (newNames.contains(serviceName)) return
+
+            if (added && added.section == "IN" && added.required == true &&
+                    (!removed || removed.required != true)) {
+                context.breakingChanges.add(changeAlert(
+                        added, removed ? "PARAM_BECAME_REQUIRED" : "NEW_REQUIRED_IN_PARAM", "CRITICAL",
+                        "Required in-parameter [${added.paramName}] was introduced for an existing service"))
+            } else if (removed && !added) {
+                String type = removed.section == "IN" ? "REMOVED_IN_PARAM" : "REMOVED_OUT_PARAM"
+                context.breakingChanges.add(changeAlert(
+                        removed, type, "HIGH",
+                        "${removed.section == 'IN' ? 'In' : 'Out'}-parameter [${removed.paramName}] was removed"))
+            } else if (added && removed && added.paramType != removed.paramType) {
+                context.breakingChanges.add(changeAlert(
+                        added, "PARAM_TYPE_CHANGED", "HIGH",
+                        "Parameter [${added.paramName}] type changed from ${removed.paramType} to ${added.paramType}"))
             }
         }
+        context.finalized = true
+    }
+
+    static void verifyServiceDefinitions(ExecutionContext ec, ServiceDiffContext context) {
+        finalizeContext(context)
+        for (Map<String, Object> service : context.newServices) {
+            try {
+                def definition = ec.service.getServiceDefinition((String) service.serviceName)
+                service.loadStatus = definition != null ? "LOADED_OK" : "NOT_FOUND_IN_ACTIVE_FRAMEWORK"
+            } catch (Exception e) {
+                service.loadStatus = "LOAD_ERROR: ${e.message}"
+                logger.warn("Service definition lookup failed for ${service.serviceName}: ${e.message}")
+            }
+        }
+    }
+
+    static String buildFullServiceName(String filePath, String verb, String noun) {
+        String normalized = filePath.replace('\\', '/')
+        int serviceIndex = normalized.indexOf("service/")
+        if (serviceIndex >= 0) normalized = normalized.substring(serviceIndex + "service/".length())
+        normalized = normalized.replaceAll(/\.xml$/, "").replace("/", ".")
+        String localName = verb && noun ? "${verb}#${noun}" : (noun ?: verb)
+        return normalized ? "${normalized}.${localName}" : localName
+    }
+
+    private static Map<String, Object> changeAlert(
+            Map<String, Object> change, String changeType, String severity, String message) {
+        return [
+                serviceName: change.serviceName, paramName: change.paramName,
+                changeType: changeType, severity: severity, paramType: change.paramType,
+                component: change.component, repo: change.repo, filePath: change.filePath,
+                tagShift: change.tagShift, message: message
+        ]
+    }
+
+    private static boolean isAdded(String line) {
+        return line.startsWith("+") && !line.startsWith("+++")
+    }
+
+    private static boolean isRemoved(String line) {
+        return line.startsWith("-") && !line.startsWith("---")
     }
 
     private static Map<String, String> parseAttributes(String text) {
         Map<String, String> attrs = [:]
-        Matcher m = PATTERN_ATTR.matcher(text)
-        while (m.find()) {
-            attrs.put(m.group(1), m.group(2))
-        }
+        Matcher matcher = ATTR_PATTERN.matcher(text)
+        while (matcher.find()) attrs.put(matcher.group(1), matcher.group(3))
         return attrs
-    }
-
-    /**
-     * Verifies that each new or modified service definition can be loaded and compiled by Moqui.
-     */
-    static void verifyServiceDefinitions(ExecutionContext ec, ServiceDiffContext ctx) {
-        if (!ec || !ctx) return
-
-        for (Map<String, Object> svc : ctx.newServices) {
-            String sName = (String) svc.serviceName
-            try {
-                def sDef = ec.service.getServiceDefinition(sName)
-                if (sDef != null) {
-                    svc.put("loadStatus", "LOADED_OK")
-                } else {
-                    svc.put("loadStatus", "NOT_FOUND_IN_ACTIVE_FRAMEWORK")
-                }
-            } catch (Exception e) {
-                svc.put("loadStatus", "COMPILATION_ERROR: " + e.message)
-                logger.warn("ServiceContractScanner: Error resolving service ${sName}: ${e.message}")
-            }
-        }
     }
 }

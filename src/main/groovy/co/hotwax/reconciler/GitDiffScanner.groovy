@@ -2,258 +2,311 @@ package co.hotwax.reconciler
 
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+
 import java.net.HttpURLConnection
 import java.net.URL
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
 import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 /**
- * GitDiffScanner
- * Fetches release diffs between two tags directly from GitHub REST API
- * (or optional local git fallback), extracts newly added entity XML definitions,
- * and catalogs the delta of metadata introduced by the release.
+ * Bounded Git diff scanner that reports incomplete scans instead of returning an empty successful result.
  */
 class GitDiffScanner {
     private static final Logger logger = LoggerFactory.getLogger(GitDiffScanner.class)
+    private static final int MAX_DIFF_BYTES = 25 * 1024 * 1024
+    private static final Pattern ATTR_PATTERN =
+            Pattern.compile(/([a-zA-Z0-9_-]+)\s*=\s*(["'])(.*?)\2/)
 
-    private static final Pattern ATTR_PATTERN = Pattern.compile(/([a-zA-Z0-9_]+)="([^"]*)"/)
-
-    /**
-     * Primary entry point: Scans GitHub API for tag diffs, or falls back to local git.
-     */
-    static Map<String, Map<String, Map<String, String>>> scanDiff(
-            String githubRepo, String githubToken, String repoRoot,
-            String fromTag, String toTag, List<String> targetEntities) {
-
-        if (githubRepo) {
-            return scanGitHubDiff(githubRepo, githubToken, fromTag, toTag, targetEntities)
-        } else if (repoRoot) {
-            return scanLocalGitDiff(repoRoot, fromTag, toTag, targetEntities)
-        } else {
-            logger.warn("Neither githubRepo nor repoRoot specified for GitDiffScanner.")
-            Map<String, Map<String, Map<String, String>>> result = [:]
-            for (String entity : targetEntities) result[entity] = [:]
-            return result
-        }
+    static class DiffScanResult {
+        boolean success
+        Map<String, Map<String, Map<String, String>>> additions = [:]
+        List<String> errors = []
+        List<String> warnings = []
+        Integer statusCode
     }
 
-    /**
-     * Fetches diff directly from GitHub REST API:
-     * GET https://api.github.com/repos/{owner}/{repo}/compare/{fromTag}...{toTag}
-     * with header 'Accept: application/vnd.github.v3.diff'
-     */
-    static Map<String, Map<String, Map<String, String>>> scanGitHubDiff(
+    static DiffScanResult scanGitHubDiffDetailed(
             String githubRepos, String githubToken, String fromTag, String toTag, List<String> targetEntities,
-            String compName = null, List<Map> codeRefs = null, ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
+            String componentName = null, List<Map> codeRefs = null,
+            ServiceContractScanner.ServiceDiffContext serviceContext = null) {
+        DiffScanResult aggregate = emptyResult(targetEntities)
+        if (!validRef(fromTag) || !validRef(toTag)) {
+            aggregate.errors.add("Invalid Git reference syntax for ${fromTag}..${toTag}")
+            return aggregate
+        }
 
-        Map<String, Map<String, Map<String, String>>> result = [:]
-        for (String entity : targetEntities) result[entity] = [:]
-
-        if (!fromTag || !toTag || !githubRepos) {
-            logger.warn("fromTag, toTag, or githubRepo not provided for GitHub diff scan.")
-            return result
+        List<String> repositories = githubRepos?.split(",")?.collect { it.trim() }?.findAll { it } ?: []
+        if (!repositories || repositories.any { !(it ==~ /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/) }) {
+            aggregate.errors.add("Invalid GitHub repository syntax")
+            return aggregate
         }
 
         String token = resolveGithubToken(githubToken)
-
-        // Support multiple comma-separated repos, e.g. "hotwax/oms,hotwax/mantle-shopify-connector"
-        List<String> repoList = githubRepos.split(",").collect { it.trim() }.findAll { !it.isEmpty() }
-
-        for (String repo : repoList) {
+        for (String repository : repositories) {
+            HttpURLConnection conn = null
             try {
-                String apiUrl = "https://api.github.com/repos/${repo}/compare/${fromTag}...${toTag}"
-                logger.info("GitDiffScanner: Querying GitHub Compare API: ${apiUrl}")
-
-                HttpURLConnection conn = (HttpURLConnection) new URL(apiUrl).openConnection()
-                conn.setRequestMethod("GET")
+                String encodedFrom = encodePath(fromTag)
+                String encodedTo = encodePath(toTag)
+                URL url = new URL("https://api.github.com/repos/${repository}/compare/${encodedFrom}...${encodedTo}")
+                conn = (HttpURLConnection) url.openConnection()
+                conn.instanceFollowRedirects = false
+                conn.requestMethod = "GET"
                 conn.setRequestProperty("Accept", "application/vnd.github.v3.diff")
-                conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler")
-                if (token) {
-                    if (token.startsWith("token ") || token.startsWith("Bearer ")) {
-                        conn.setRequestProperty("Authorization", token)
-                    } else {
-                        conn.setRequestProperty("Authorization", "token " + token)
-                    }
-                }
-                conn.setConnectTimeout(30000)
-                conn.setReadTimeout(120000)
+                conn.setRequestProperty("User-Agent", "Moqui-Data-Reconciler/2.0")
+                if (token) conn.setRequestProperty("Authorization", normalizeGithubAuthorization(token))
+                conn.connectTimeout = 30_000
+                conn.readTimeout = 120_000
 
-                int responseCode = conn.getResponseCode()
-                if (responseCode == 200) {
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))
-                    parseDiffStream(reader, targetEntities, result, repo, compName, "${fromTag}➔${toTag}", codeRefs, serviceCtx)
-                    reader.close()
-                    logger.info("GitDiffScanner: Successfully parsed GitHub diff from ${repo} for ${fromTag}..${toTag}")
-                } else if (responseCode == 404) {
-                    logger.warn("GitDiffScanner: Repository or tags not found on GitHub (${responseCode}): ${apiUrl}")
-                } else {
-                    logger.warn("GitDiffScanner: GitHub API returned HTTP ${responseCode} for ${apiUrl}")
+                int status = conn.responseCode
+                aggregate.statusCode = status
+                if (status != 200) {
+                    aggregate.errors.add("GitHub compare failed for ${repository} ${fromTag}..${toTag}: HTTP ${status}")
+                    continue
                 }
+
+                String diff = readBounded(conn.inputStream, MAX_DIFF_BYTES)
+                DiffScanResult parsed = parseDiffText(
+                        diff, targetEntities, repository, componentName, "${fromTag}->${toTag}", codeRefs, serviceContext)
+                merge(aggregate, parsed)
             } catch (Exception e) {
-                logger.error("Error fetching GitHub diff for ${repo}: ${e.message}", e)
+                aggregate.errors.add("${repository}: ${e.class.simpleName}: ${e.message}")
+                logger.warn("GitHub diff scan failed for ${repository}: ${e.message}")
+            } finally {
+                conn?.disconnect()
             }
         }
-
-        return result
+        aggregate.success = aggregate.errors.isEmpty()
+        return aggregate
     }
 
-    /**
-     * Local git diff execution fallback.
-     */
-    static Map<String, Map<String, Map<String, String>>> scanLocalGitDiff(
+    static DiffScanResult scanLocalGitDiffDetailed(
             String repoRoot, String fromTag, String toTag, List<String> targetEntities,
-            String compName = null, List<Map> codeRefs = null, ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
-
-        Map<String, Map<String, Map<String, String>>> result = [:]
-        for (String entity : targetEntities) result[entity] = [:]
-
-        File rootDir = new File(repoRoot)
-        if (!rootDir.exists() || !rootDir.isDirectory()) return result
-
+            String componentName = null, List<Map> codeRefs = null,
+            ServiceContractScanner.ServiceDiffContext serviceContext = null) {
+        DiffScanResult result = emptyResult(targetEntities)
         try {
-            List<String> command = ["git", "diff", "${fromTag}..${toTag}"]
-            ProcessBuilder pb = new ProcessBuilder(command)
-            pb.directory(rootDir)
-            pb.redirectErrorStream(true)
-            Process proc = pb.start()
-
-            BufferedReader reader = new BufferedReader(new InputStreamReader(proc.inputStream))
-            parseDiffStream(reader, targetEntities, result, repoRoot, compName, "${fromTag}➔${toTag}", codeRefs, serviceCtx)
-            reader.close()
-            proc.waitFor()
+            if (!validRef(fromTag) || !validRef(toTag)) throw new IllegalArgumentException("Invalid Git reference syntax")
+            File root = new File(repoRoot).canonicalFile
+            if (!root.isDirectory() || !new File(root, ".git").isDirectory()) {
+                throw new IllegalArgumentException("Local repository path is not a Git repository")
+            }
+            Process process = new ProcessBuilder("git", "diff", "--no-ext-diff", "${fromTag}..${toTag}")
+                    .directory(root).redirectErrorStream(true).start()
+            String diff = readBounded(process.inputStream, MAX_DIFF_BYTES)
+            int exit = process.waitFor()
+            if (exit != 0) {
+                result.errors.add("Local git diff failed with exit ${exit}: ${diff.take(1000)}")
+                return result
+            }
+            result = parseDiffText(diff, targetEntities, root.path, componentName,
+                    "${fromTag}->${toTag}", codeRefs, serviceContext)
+            return result
         } catch (Exception e) {
-            logger.error("Error executing local git diff in ${repoRoot}: ${e.message}", e)
+            result.errors.add("${e.class.simpleName}: ${e.message}")
+            return result
+        }
+    }
+
+    static DiffScanResult parseDiffText(
+            String diff, List<String> targetEntities, String repo = null, String componentName = null,
+            String tagShift = null, List<Map> codeRefs = null,
+            ServiceContractScanner.ServiceDiffContext serviceContext = null) {
+        DiffScanResult result = emptyResult(targetEntities)
+        String currentFile = ""
+        boolean dataFile = false
+        boolean codeFile = false
+        boolean serviceFile = false
+        StringBuilder entityTag = null
+
+        diff.eachLine { String line ->
+            if (line.startsWith("diff --git ")) {
+                if (entityTag != null) {
+                    result.errors.add("Incomplete added XML tag in ${currentFile}")
+                    entityTag = null
+                }
+                currentFile = extractCurrentFile(line)
+                String lower = currentFile.toLowerCase(Locale.ROOT)
+                dataFile = lower.startsWith("data/") || lower.contains("/data/") ||
+                        lower.startsWith("upgrade/") || lower.contains("/upgrade/") ||
+                        lower.endsWith("data.xml") || lower.endsWith("seed.xml")
+                serviceFile = (lower.startsWith("service/") || lower.contains("/service/")) && lower.endsWith(".xml")
+                codeFile = !dataFile && !serviceFile &&
+                        (lower.endsWith(".groovy") || lower.endsWith(".java") || lower.endsWith(".xml") ||
+                                lower.endsWith(".js") || lower.endsWith(".ts"))
+            }
+
+            if (serviceFile && serviceContext != null) {
+                try {
+                    ServiceContractScanner.processLine(
+                            line, currentFile, repo, componentName, tagShift, serviceContext)
+                } catch (Exception e) {
+                    result.errors.add("Service diff parse failed in ${currentFile}: ${e.message}")
+                }
+            }
+
+            boolean added = line.startsWith("+") && !line.startsWith("+++")
+            if (!added) {
+                if (entityTag != null && !line.startsWith("\\ No newline")) {
+                    result.errors.add("Added XML tag in ${currentFile} is split across non-added diff context")
+                    entityTag = null
+                }
+                return
+            }
+
+            String clean = line.substring(1).trim()
+            if (!clean) return
+
+            if (dataFile) {
+                if (entityTag != null) {
+                    entityTag.append(" ").append(clean)
+                    if (clean.contains(">")) {
+                        processEntityTag(entityTag.toString(), targetEntities, result.additions)
+                        entityTag = null
+                    }
+                } else if (startsTargetEntityTag(clean, targetEntities)) {
+                    if (clean.contains(">")) {
+                        processEntityTag(clean, targetEntities, result.additions)
+                    } else {
+                        entityTag = new StringBuilder(clean)
+                    }
+                }
+            }
+
+            if (codeFile && codeRefs != null) {
+                CodeReferenceScanner.scanLineForReferences(
+                        clean, currentFile, repo, componentName, tagShift, codeRefs)
+            }
         }
 
+        if (entityTag != null) result.errors.add("Incomplete added XML tag in ${currentFile}")
+        result.success = result.errors.isEmpty()
         return result
     }
 
-    private static void parseDiffStream(
-            BufferedReader reader, List<String> targetEntities, Map<String, Map<String, Map<String, String>>> result,
-            String repo = null, String compName = null, String tagShift = null, List<Map> codeRefs = null,
-            ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
+    /** Compatibility entry point. Call detailed variants when correctness matters. */
+    static Map<String, Map<String, Map<String, String>>> scanDiff(
+            String githubRepo, String githubToken, String repoRoot,
+            String fromTag, String toTag, List<String> targetEntities) {
+        DiffScanResult result = githubRepo ?
+                scanGitHubDiffDetailed(githubRepo, githubToken, fromTag, toTag, targetEntities) :
+                scanLocalGitDiffDetailed(repoRoot, fromTag, toTag, targetEntities)
+        return result.additions
+    }
 
-        String line
-        String currentFile = ""
-        boolean inDataXml = false
-        boolean inCodeFile = false
-        boolean isServiceXml = false
+    static Map<String, Map<String, Map<String, String>>> scanGitHubDiff(
+            String githubRepos, String githubToken, String fromTag, String toTag, List<String> targetEntities,
+            String componentName = null, List<Map> codeRefs = null,
+            ServiceContractScanner.ServiceDiffContext serviceContext = null) {
+        return scanGitHubDiffDetailed(githubRepos, githubToken, fromTag, toTag, targetEntities,
+                componentName, codeRefs, serviceContext).additions
+    }
 
-        while ((line = reader.readLine()) != null) {
-            // Check file header to identify current file path and type
-            if (line.startsWith("diff --git a/")) {
-                String[] parts = line.split(" ")
-                if (parts.length >= 4) {
-                    currentFile = parts[3].startsWith("b/") ? parts[3].substring(2) : parts[3]
-                } else {
-                    currentFile = line
-                }
-                String lower = currentFile.toLowerCase()
-                inDataXml = lower.contains("/data/") || lower.contains("/upgrade/") || lower.endsWith("data.xml")
-                isServiceXml = lower.contains("/service/") && lower.endsWith(".xml")
-                inCodeFile = !inDataXml && !isServiceXml && (lower.endsWith(".groovy") || lower.endsWith(".java") || lower.endsWith(".xml") || lower.endsWith(".js") || lower.endsWith(".ts"))
-            }
+    private static DiffScanResult emptyResult(List<String> targetEntities) {
+        DiffScanResult result = new DiffScanResult()
+        for (String entity : targetEntities ?: []) result.additions.put(entity, [:])
+        return result
+    }
 
-            // 1. Service Contract & Breaking Change Scanner
-            if (isServiceXml && serviceCtx != null) {
-                try {
-                    ServiceContractScanner.processLine(line, currentFile, repo, compName, tagShift, serviceCtx)
-                } catch (Exception e) {
-                    logger.debug("Error in ServiceContractScanner: ${e.message}")
-                }
-            }
+    private static void merge(DiffScanResult target, DiffScanResult source) {
+        source.additions.each { String entity, Map<String, Map<String, String>> records ->
+            target.additions.computeIfAbsent(entity) { [:] }.putAll(records)
+        }
+        target.errors.addAll(source.errors)
+        target.warnings.addAll(source.warnings)
+    }
 
-            // Lines added in the diff (starting with + but not ++)
-            if (line.startsWith("+") && !line.startsWith("++")) {
-                String cleanLine = line.substring(1).trim()
-                if (cleanLine.isEmpty()) continue
+    private static String extractCurrentFile(String header) {
+        int marker = header.indexOf(" b/")
+        if (marker < 0) return header
+        String path = header.substring(marker + 3).trim()
+        if (path.startsWith('"') && path.endsWith('"')) path = path.substring(1, path.length() - 1)
+        return path
+    }
 
-                // 2. Data XML entity tag parsing
-                if (inDataXml) {
-                    for (String entity : targetEntities) {
-                        String shortName = entity.contains(".") ? entity.substring(entity.lastIndexOf('.') + 1) : entity
-                        if (cleanLine.contains("<${entity}") || cleanLine.contains("<${shortName}")) {
-                            Map<String, String> attrs = parseAttributes(cleanLine)
-                            String pk = extractPrimaryKey(entity, attrs)
-                            if (pk) {
-                                result[entity][pk] = attrs
-                            }
-                        }
-                    }
-                }
+    private static boolean startsTargetEntityTag(String line, List<String> targetEntities) {
+        for (String entity : targetEntities) {
+            String shortName = entity.substring(entity.lastIndexOf(".") + 1)
+            if (line ==~ /.*<(?:${Pattern.quote(entity)}|${Pattern.quote(shortName)})(?:\s|\/?>|$).*/) return true
+        }
+        return false
+    }
 
-                // 3. Code file scanning for ghost/orphan enum & status references
-                if (inCodeFile && codeRefs != null) {
-                    try {
-                        CodeReferenceScanner.scanLineForReferences(cleanLine, currentFile, repo, compName, tagShift, codeRefs)
-                    } catch (Exception e) {
-                        logger.debug("Error scanning code line: ${e.message}")
-                    }
-                }
-            }
+    private static void processEntityTag(
+            String tag, List<String> targetEntities,
+            Map<String, Map<String, Map<String, String>>> additions) {
+        for (String entity : targetEntities) {
+            String shortName = entity.substring(entity.lastIndexOf(".") + 1)
+            Pattern tagPattern = Pattern.compile("<(?:" + Pattern.quote(entity) + "|" + Pattern.quote(shortName) + ")(?:\\s|/?>)")
+            if (!tagPattern.matcher(tag).find()) continue
+            Map<String, String> attrs = parseAttributes(tag)
+            String key = extractPrimaryKey(entity, attrs)
+            if (key) additions.get(entity).put(key, attrs)
         }
     }
 
-    private static Map<String, String> parseAttributes(String xmlTag) {
+    static Map<String, String> parseAttributes(String xmlTag) {
         Map<String, String> attrs = [:]
-        Matcher m = ATTR_PATTERN.matcher(xmlTag)
-        while (m.find()) {
-            attrs[m.group(1)] = m.group(2)
-        }
+        Matcher matcher = ATTR_PATTERN.matcher(xmlTag)
+        while (matcher.find()) attrs.put(matcher.group(1), unescapeXml(matcher.group(3)))
         return attrs
     }
 
-    private static String extractPrimaryKey(String entityName, Map<String, String> attrs) {
-        if (entityName.endsWith("Enumeration")) return attrs.get("enumId")
-        if (entityName.endsWith("EnumerationType")) return attrs.get("enumTypeId")
-        if (entityName.endsWith("StatusItem")) return attrs.get("statusId")
-        if (entityName.endsWith("StatusType")) return attrs.get("statusTypeId")
-        if (entityName.endsWith("SystemMessageType")) return attrs.get("systemMessageTypeId")
-        if (entityName.endsWith("Uom")) return attrs.get("uomId")
-        if (entityName.endsWith("ProductFeatureType")) return attrs.get("productFeatureTypeId")
-        if (entityName.endsWith("FacilityType")) return attrs.get("facilityTypeId")
-        for (String k : attrs.keySet()) {
-            if (k.toLowerCase().endsWith("id")) return attrs.get(k)
-        }
-        return attrs.values() ? attrs.values().iterator().next() : null
+    static String extractPrimaryKey(String entityName, Map<String, String> attrs) {
+        Map<String, String> fields = [
+                "moqui.basic.Enumeration": "enumId",
+                "moqui.basic.EnumerationType": "enumTypeId",
+                "moqui.basic.StatusItem": "statusId",
+                "moqui.basic.StatusType": "statusTypeId",
+                "moqui.service.message.SystemMessageType": "systemMessageTypeId",
+                "moqui.basic.Uom": "uomId",
+                "mantle.product.feature.ProductFeatureType": "productFeatureTypeId",
+                "mantle.facility.FacilityType": "facilityTypeId"
+        ]
+        String field = fields.get(entityName)
+        return field ? attrs.get(field) : null
     }
 
     static String resolveGithubToken(String explicitToken) {
         if (explicitToken?.trim()) return explicitToken.trim()
+        String envToken = System.getenv("GITHUB_TOKEN") ?: System.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
+        String propertyToken = System.getProperty("github.token")
+        return envToken?.trim() ?: propertyToken?.trim()
+    }
 
-        String envToken = System.getenv("GITHUB_TOKEN") ?: System.getenv("GITHUB_PERSONAL_ACCESS_TOKEN") ?: System.getProperty("github.token")
-        if (envToken?.trim()) return envToken.trim()
+    private static boolean validRef(String ref) {
+        return ref ==~ /^[A-Za-z0-9._\/-]{1,120}$/
+    }
 
-        // 1. Check ~/.git-credentials
-        try {
-            File gitCreds = new File(System.getProperty("user.home") + "/.git-credentials")
-            if (gitCreds.exists()) {
-                for (String line : gitCreds.readLines()) {
-                    Matcher m = Pattern.compile(/https:\/\/[^:]+:(ghp_[a-zA-Z0-9_]+)@github\.com/).matcher(line)
-                    if (m.find()) return m.group(1)
-                    Matcher m2 = Pattern.compile(/https:\/\/[^:]+:([^@]+)@github\.com/).matcher(line)
-                    if (m2.find() && m2.group(1).startsWith("gh")) return m2.group(1)
-                }
+    private static String encodePath(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8.name()).replace("+", "%20")
+    }
+
+    private static String normalizeGithubAuthorization(String token) {
+        if (token.regionMatches(true, 0, "Bearer ", 0, 7)) return "Bearer " + token.substring(7).trim()
+        if (token.regionMatches(true, 0, "token ", 0, 6)) return "token " + token.substring(6).trim()
+        return "Bearer " + token.trim()
+    }
+
+    private static String readBounded(InputStream stream, int maxBytes) {
+        ByteArrayOutputStream output = new ByteArrayOutputStream()
+        byte[] buffer = new byte[8192]
+        int total = 0
+        stream.withCloseable {
+            int read
+            while ((read = it.read(buffer)) >= 0) {
+                total += read
+                if (total > maxBytes) throw new IOException("Diff exceeds ${maxBytes} bytes")
+                output.write(buffer, 0, read)
             }
-        } catch (Exception e) {
-            logger.debug("Could not read ~/.git-credentials: ${e.message}")
         }
+        return output.toString(StandardCharsets.UTF_8.name())
+    }
 
-        // 2. Check mcp_config.json
-        try {
-            File mcpConfig = new File(System.getProperty("user.home") + "/.gemini/config/mcp_config.json")
-            if (mcpConfig.exists()) {
-                def json = new groovy.json.JsonSlurper().parse(mcpConfig)
-                String mcpToken = json?.mcpServers?.github?.env?.GITHUB_PERSONAL_ACCESS_TOKEN
-                if (mcpToken?.trim()) return mcpToken.trim()
-            }
-        } catch (Exception e) {
-            logger.debug("Could not read mcp_config.json for github token: ${e.message}")
-        }
-
-        return null
+    private static String unescapeXml(String value) {
+        return value.replace("&quot;", '"').replace("&apos;", "'")
+                .replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
     }
 }
 

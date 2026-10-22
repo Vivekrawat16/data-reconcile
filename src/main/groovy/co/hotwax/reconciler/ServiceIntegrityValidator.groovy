@@ -1,20 +1,14 @@
 package co.hotwax.reconciler
 
+import org.moqui.context.ExecutionContext
+import org.moqui.entity.EntityList
+import org.moqui.entity.EntityValue
+import org.moqui.resource.ResourceReference
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import org.moqui.context.ExecutionContext
-import org.moqui.entity.EntityValue
-import org.moqui.entity.EntityList
-import org.moqui.resource.ResourceReference
 
 /**
- * ServiceIntegrityValidator (Phase 2)
- * Performs deep runtime pre-flight validation on services modified or introduced in a release:
- * 1. Script Location Verification: Confirms that referenced scripts (component://.../*.groovy) exist on disk.
- * 2. Downstream Service Call Verification: Verifies that <service-call name="..."> targets valid services.
- * 3. Scheduled Job (moqui.service.job.ServiceJob) Compatibility Audit:
- *    Checks if existing scheduled background jobs configured in the database will break due to
- *    new required parameters or changed service contracts!
+ * Validates script locations and active scheduled-job compatibility for changed services.
  */
 class ServiceIntegrityValidator {
     private static final Logger logger = LoggerFactory.getLogger(ServiceIntegrityValidator.class)
@@ -22,125 +16,97 @@ class ServiceIntegrityValidator {
     static class Phase2AuditResult {
         List<Map<String, Object>> scriptLocationAlerts = []
         List<Map<String, Object>> brokenScheduledJobAlerts = []
-        List<Map<String, Object>> downstreamServiceAlerts = []
-        int totalScriptsVerified = 0
-        int totalDownstreamCallsVerified = 0
-        int totalScheduledJobsAudited = 0
+        int totalScriptsVerified
+        int totalScheduledJobsAudited
+        List<String> errors = []
     }
 
-    /**
-     * Executes Phase 2 deep integrity audit.
-     */
-    static Phase2AuditResult runAudit(ExecutionContext ec, ServiceContractScanner.ServiceDiffContext ctx) {
+    static Phase2AuditResult runAudit(
+            ExecutionContext ec, ServiceContractScanner.ServiceDiffContext context) {
         Phase2AuditResult result = new Phase2AuditResult()
-        if (!ec || !ctx) return result
-
-        // 1. Verify Script Locations for New and Modified Services
-        auditScriptLocations(ec, ctx, result)
-
-        // 2. Audit Scheduled Jobs (ServiceJob) for Breaking Contract Changes
-        auditScheduledJobs(ec, ctx, result)
-
+        if (!ec || !context) return result
+        ServiceContractScanner.finalizeContext(context)
+        auditScriptLocations(ec, context, result)
+        auditScheduledJobs(ec, context, result)
         return result
     }
 
-    /**
-     * Checks if service scripts (e.g. type="script" location="component://...") actually exist.
-     */
-    private static void auditScriptLocations(ExecutionContext ec, ServiceContractScanner.ServiceDiffContext ctx, Phase2AuditResult result) {
-        Set<String> checkedLocations = new HashSet<>()
-
-        for (Map<String, Object> svc : ctx.newServices) {
-            String loc = (String) svc.get("location")
-            if (!loc || checkedLocations.contains(loc)) continue
-            checkedLocations.add(loc)
+    private static void auditScriptLocations(
+            ExecutionContext ec, ServiceContractScanner.ServiceDiffContext context,
+            Phase2AuditResult result) {
+        Set<String> checked = []
+        List<Map<String, Object>> services = []
+        services.addAll(context.newServices)
+        services.addAll(context.modifiedServices)
+        for (Map<String, Object> service : services) {
+            String location = (String) service.location
+            if (!location || !checked.add(location)) continue
             result.totalScriptsVerified++
-
             try {
-                ResourceReference rr = ec.resource.getLocationReference(loc)
-                if (rr == null || !rr.getExists()) {
+                ResourceReference reference = ec.resource.getLocationReference(location)
+                if (reference == null || !reference.exists) {
                     result.scriptLocationAlerts.add([
-                        serviceName: svc.serviceName,
-                        location: loc,
-                        component: svc.component,
-                        severity: "CRITICAL",
-                        message: "Referenced script [${loc}] does NOT exist on filesystem. Service call will throw ResourceNotFoundException!"
+                            serviceName: service.serviceName, location: location,
+                            component: service.component, severity: "CRITICAL",
+                            message: "Referenced service script does not exist"
                     ])
                 }
             } catch (Exception e) {
                 result.scriptLocationAlerts.add([
-                    serviceName: svc.serviceName,
-                    location: loc,
-                    component: svc.component,
-                    severity: "HIGH",
-                    message: "Error verifying script location [${loc}]: ${e.message}"
+                        serviceName: service.serviceName, location: location,
+                        component: service.component, severity: "HIGH",
+                        message: "Script location validation failed: ${e.message}"
                 ])
             }
         }
     }
 
-    /**
-     * Cross-references breaking changes against active moqui.service.job.ServiceJob records in the database.
-     */
-    private static void auditScheduledJobs(ExecutionContext ec, ServiceContractScanner.ServiceDiffContext ctx, Phase2AuditResult result) {
-        if (!ctx.breakingChanges) return
+    private static void auditScheduledJobs(
+            ExecutionContext ec, ServiceContractScanner.ServiceDiffContext context,
+            Phase2AuditResult result) {
+        List<Map<String, Object>> requiredChanges =
+                context.breakingChanges.findAll { it.changeType in ["NEW_REQUIRED_IN_PARAM", "PARAM_BECAME_REQUIRED"] }
+        if (!requiredChanges) return
 
-        // Map breaking changes by service name
-        Map<String, List<Map<String, Object>>> breakingByService = [:]
-        for (Map<String, Object> bc : ctx.breakingChanges) {
-            String sName = (String) bc.serviceName
-            if (!breakingByService.containsKey(sName)) breakingByService.put(sName, [])
-            breakingByService.get(sName).add(bc)
-        }
-
+        Map<String, List<Map<String, Object>>> byService = requiredChanges.groupBy { it.serviceName }
         try {
             EntityList jobs = ec.entity.find("moqui.service.job.ServiceJob").list()
-            if (!jobs) return
-
+            Date now = new Date()
             for (EntityValue job : jobs) {
-                String jobServiceName = (String) job.get("serviceName")
-                if (!jobServiceName) continue
+                if (!isActiveScheduledJob(job, now)) continue
+                String serviceName = (String) job.serviceName
+                List<Map<String, Object>> changes = byService.get(serviceName)
+                if (!changes) continue
 
-                // Check if this job executes any service with breaking changes
-                for (String breakingSvc : breakingByService.keySet()) {
-                    if (jobServiceName.contains(breakingSvc) || jobServiceName.endsWith(breakingSvc)) {
-                        result.totalScheduledJobsAudited++
-                        String jobName = (String) job.get("jobName")
-                        String paused = (String) job.get("paused") ?: "N"
-
-                        // Fetch configured parameters for this job
-                        EntityList jobParams = ec.entity.find("moqui.service.job.ServiceJobParameter")
-                                .condition("jobName", jobName).list()
-                        Set<String> configuredParamNames = new HashSet<>()
-                        for (EntityValue jp : jobParams) {
-                            String pName = (String) jp.get("parameterName")
-                            if (pName) configuredParamNames.add(pName)
-                        }
-
-                        // Verify if all new required parameters are present in job configuration
-                        List<Map<String, Object>> breakingList = breakingByService.get(breakingSvc)
-                        for (Map<String, Object> bc : breakingList) {
-                            if ("NEW_REQUIRED_IN_PARAM".equals(bc.changeType)) {
-                                String reqParam = (String) bc.paramName
-                                if (!configuredParamNames.contains(reqParam)) {
-                                    result.brokenScheduledJobAlerts.add([
-                                        jobName: jobName,
-                                        serviceName: jobServiceName,
-                                        breakingService: breakingSvc,
-                                        missingParam: reqParam,
-                                        paused: paused,
-                                        severity: "CRITICAL",
-                                        component: bc.component,
-                                        message: "Scheduled Job [${jobName}] calls service [${breakingSvc}], but does NOT configure new required parameter [${reqParam}]. Job will FAIL on next execution!"
-                                    ])
-                                }
-                            }
-                        }
-                    }
+                result.totalScheduledJobsAudited++
+                String jobName = (String) job.jobName
+                EntityList parameters = ec.entity.find("moqui.service.job.ServiceJobParameter")
+                        .condition("jobName", jobName).list()
+                Set<String> configured = parameters.collect { it.parameterName as String } as Set
+                for (Map<String, Object> change : changes) {
+                    String requiredName = (String) change.paramName
+                    if (configured.contains(requiredName)) continue
+                    result.brokenScheduledJobAlerts.add([
+                            jobName: jobName, serviceName: serviceName,
+                            missingParam: requiredName, paused: job.paused ?: "N",
+                            severity: "CRITICAL", component: change.component,
+                            message: "Active scheduled job lacks new required parameter [${requiredName}]"
+                    ])
                 }
             }
         } catch (Exception e) {
-            logger.warn("ServiceIntegrityValidator: Error auditing ServiceJob records: ${e.message}")
+            result.errors.add("Scheduled-job audit failed: ${e.message}")
+            logger.warn("Scheduled-job audit failed: ${e.message}")
         }
+    }
+
+    static boolean isActiveScheduledJob(Map job, Date now = new Date()) {
+        if (!job?.cronExpression) return false
+        if ("Y".equalsIgnoreCase(job.paused as String)) return false
+        Date fromDate = job.fromDate as Date
+        Date thruDate = job.thruDate as Date
+        if (fromDate && fromDate.after(now)) return false
+        if (thruDate && !thruDate.after(now)) return false
+        return true
     }
 }

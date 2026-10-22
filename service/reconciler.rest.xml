@@ -4,7 +4,6 @@
           name="reconciler" displayName="Release Metadata Reconciler API" version="1.0.0">
 
     <resource name="run" require-authentication="true">
-        <description>Runs automated release reconciliation and optional auto-apply</description>
         <method type="post">
             <service name="co.hotwax.reconciler.ReconcileServices.reconcile#ReleaseMetadata"/>
         </method>

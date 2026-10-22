@@ -1,0 +1,38 @@
+plugins {
+    id 'groovy'
+}
+
+def componentNode = parseComponent(project)
+version = componentNode.'@version'
+
+def moquiDir = projectDir.parentFile.parentFile.parentFile
+def frameworkDir = file(moquiDir.absolutePath + '/framework')
+def jarBaseName = componentNode.'@name'
+
+repositories {
+    flatDir name: 'localLib', dirs: frameworkDir.absolutePath + '/lib'
+    mavenCentral()
+}
+
+java {
+    sourceCompatibility = 21
+    targetCompatibility = 21
+}
+
+tasks.withType(JavaCompile) { options.compilerArgs << '-proc:none' }
+tasks.withType(GroovyCompile) { options.compilerArgs << '-proc:none' }
+
+dependencies {
+    implementation project(':framework')
+
+    testImplementation platform('org.spockframework:spock-bom:2.4-groovy-5.0')
+    testImplementation 'org.spockframework:spock-core:2.4-groovy-5.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:6.0.1'
+}
+
+tasks.named('test') { useJUnitPlatform() }
+
+jar {
+    destinationDirectory = file(projectDir.absolutePath + '/lib')
+    archiveBaseName = jarBaseName
+}
