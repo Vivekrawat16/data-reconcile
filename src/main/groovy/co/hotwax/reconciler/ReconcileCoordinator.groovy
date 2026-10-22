@@ -229,12 +229,14 @@ class ReconcileCoordinator {
 
     static String resolveManagedCredential(Object suppliedCredential, String environmentName) {
         String supplied = suppliedCredential?.toString()?.trim()
-        if (supplied && !"true".equalsIgnoreCase(
-                System.getProperty("data.reconciler.requestCredentialsEnabled"))) {
-            throw new SecurityException(
-                    "Request-supplied credentials are disabled; configure ${environmentName} on the server")
+        if (supplied) {
+            if ("false".equalsIgnoreCase(System.getProperty("data.reconciler.requestCredentialsEnabled"))) {
+                throw new SecurityException(
+                        "Request-supplied credentials are disabled; configure ${environmentName} on the server")
+            }
+            return supplied
         }
-        return supplied ?: System.getenv(environmentName)
+        return System.getenv(environmentName) ?: System.getProperty(environmentName)
     }
 
     private static Map<String, Object> initialOutput() {
