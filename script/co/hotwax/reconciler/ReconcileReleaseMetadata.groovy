@@ -5,4 +5,9 @@ if (!ec.user.hasPermission('DATA_RECONCILE_ADMIN')) {
     return
 }
 
+if (!"false".equalsIgnoreCase(System.getProperty("data.reconciler.requestCredentialsEnabled"))) {
+    System.setProperty("data.reconciler.requestCredentialsEnabled", "true")
+}
+
 return ReconcileCoordinator.reconcile(ec, context)
+
