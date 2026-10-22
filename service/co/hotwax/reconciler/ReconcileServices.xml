@@ -114,7 +114,7 @@
 
                 if (shifts) {
                     for (def shift : shifts) {
-                        if (shift.fromTag && shift.toTag && shift.repo) {
+                        if (shift.fromTag && shift.toTag && shift.repo && !resolverClass.isExcluded(shift.name, shift.repo)) {
                             Map compDiff = scannerClass.scanGitHubDiff(
                                 shift.repo, token, shift.fromTag, shift.toTag, entities, shift.name, rawCodeRefs, serviceCtx
                             )

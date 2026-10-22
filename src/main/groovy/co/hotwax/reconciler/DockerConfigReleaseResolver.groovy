@@ -19,6 +19,26 @@ class DockerConfigReleaseResolver {
     private static final Pattern ATTR_PATTERN = Pattern.compile(/([a-zA-Z0-9_-]+)="([^"]*)"/)
     private static final Pattern DOCKERFILE_CLONE_PATTERN = Pattern.compile(/^([+-])\s*RUN\s+git\s+clone\s+.*-b\s+"([^"]+)"\s+https:\/\/github\.com\/([^\/]+)\/([^.]+)\.git/)
 
+    public static final Set<String> EXCLUDED_COMPONENTS = [
+        "moqui-framework",
+        "moqui-runtime",
+        "hotwax-maarg-docker-config",
+        "maarg-docker-config",
+        "hotwax-maargsetup",
+        "maargsetup"
+    ] as Set
+
+    public static boolean isExcluded(String name, String repoName) {
+        if (!name && !repoName) return false
+        String n = (name ?: "").toLowerCase().trim()
+        String r = (repoName ?: "").toLowerCase().trim()
+        return EXCLUDED_COMPONENTS.contains(n) || EXCLUDED_COMPONENTS.contains(r) ||
+               n.contains("moqui-framework") || r.contains("moqui-framework") ||
+               n.contains("moqui-runtime") || r.contains("moqui-runtime") ||
+               n.contains("docker-config") || r.contains("docker-config") ||
+               n.contains("maargsetup") || r.contains("maargsetup")
+    }
+
     /**
      * Represents a single component whose version changed in the release.
      */
@@ -160,6 +180,7 @@ class DockerConfigReleaseResolver {
 
         // Process myaddons.xml shifts
         for (Map<String, String> comp : addonComponents.values()) {
+            if (isExcluded(comp.name, comp.repoName)) continue
             String fromVer = comp.fromVersion
             String toVer = comp.toVersion
             if (toVer && fromVer != toVer) {
@@ -178,6 +199,7 @@ class DockerConfigReleaseResolver {
         // Process Dockerfile shifts (avoid duplicate if already in myaddons)
         Set<String> existingRepos = result.collect { it.repo } as Set
         for (Map<String, String> comp : dockerfileComponents.values()) {
+            if (isExcluded(comp.name, comp.repoName)) continue
             String fullRepo = comp.group + "/" + comp.repoName
             if (existingRepos.contains(fullRepo)) continue
             String fromVer = comp.fromVersion
