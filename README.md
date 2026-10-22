@@ -162,3 +162,14 @@ The reconciler:
    - Emits a high-priority **Developer Omission Alert**.
    - Identifies the exact component, file, line snippet, and tag shift.
    - Generates copy-pasteable XML stubs for instant recovery!
+
+---
+
+## ⚡ 7. Service Contract & Breaking Change Scanner (Phase 1)
+
+Whenever services in Moqui are updated between release tags:
+1. **Detects Breaking In-Parameters:** Identifies existing services that added a new `required="true"` parameter (which breaks existing callers and scheduled jobs that do not pass it).
+2. **Detects Removed In/Out Parameters:** Catches deleted parameters from existing services that calling code relies on.
+3. **Detects Deleted/Renamed Services:** Flags services removed from XML files.
+4. **New Services Catalog:** Catalogs all newly introduced services with their implementation type (`inline`, `script`, `oms-rest`, etc.).
+5. **Pre-flight Definition Verification:** Uses Moqui's Service Facade to verify that every new or modified service compiles and loads without error.

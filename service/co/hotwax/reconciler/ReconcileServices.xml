@@ -58,6 +58,9 @@
             <parameter name="shiftedComponentsCount" type="Integer"/>
             <parameter name="totalOmissionAlerts" type="Integer"/>
             <parameter name="omissionAlerts" type="List"/>
+            <parameter name="totalServiceBreakingChanges" type="Integer"/>
+            <parameter name="serviceBreakingChanges" type="List"/>
+            <parameter name="newServicesIntroduced" type="List"/>
             <parameter name="resultsByEntity" type="Map"/>
             <parameter name="combinedSyncXml"/>
             <parameter name="summaryReport"/>
@@ -68,6 +71,7 @@
                 GroovyClassLoader gcl = ec.factory.getGroovyClassLoader() ?: new GroovyClassLoader(Thread.currentThread().contextClassLoader ?: ec.class.classLoader)
                 String compPath = ec.factory.getRuntimePath() + "/component/data-reconciler"
                 Class codeScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/CodeReferenceScanner.groovy"))
+                Class serviceScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ServiceContractScanner.groovy"))
                 Class scannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/GitDiffScanner.groovy"))
                 Class resolverClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/DockerConfigReleaseResolver.groovy"))
                 gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/RemoteInstanceClient.groovy"))
@@ -87,13 +91,14 @@
                 Map<String, Map<String, Map<String, String>>> allGitAdditions = [:]
                 Map<String, String> entityPkOrigins = [:]
                 List<Map> rawCodeRefs = []
+                def serviceCtx = serviceScannerClass.createContext()
                 for (String entity : entities) allGitAdditions[entity] = [:]
 
                 if (shifts) {
                     for (def shift : shifts) {
                         if (shift.fromTag && shift.toTag && shift.repo) {
                             Map compDiff = scannerClass.scanGitHubDiff(
-                                shift.repo, token, shift.fromTag, shift.toTag, entities, shift.name, rawCodeRefs
+                                shift.repo, token, shift.fromTag, shift.toTag, entities, shift.name, rawCodeRefs, serviceCtx
                             )
                             for (String entity : entities) {
                                 Map compEntityMap = compDiff[entity] ?: [:]
@@ -226,7 +231,59 @@
                     }
                 }
 
-                if (totalCritical > 0 && omissions.size() > 0) {
+                // 4. Phase 1: Service Contract & Breaking Change Audit
+                serviceScannerClass.verifyServiceDefinitions(ec, serviceCtx)
+                List<Map<String, Object>> breakingChanges = (List<Map<String, Object>>) serviceCtx.breakingChanges
+                List<Map<String, Object>> newServices = (List<Map<String, Object>>) serviceCtx.newServices
+                List<Map<String, Object>> deletedServices = (List<Map<String, Object>>) serviceCtx.deletedServices
+
+                if (breakingChanges || newServices || deletedServices) {
+                    report.append("================================================================================\n")
+                    report.append("                    SERVICE CONTRACT & BREAKING CHANGE AUDIT                    \n")
+                    report.append("================================================================================\n")
+                    report.append(String.format("  - Breaking Contract Changes  : %d\n", breakingChanges.size()))
+                    report.append(String.format("  - New Services Introduced    : %d\n", newServices.size()))
+                    report.append(String.format("  - Services Deleted / Renamed : %d\n", deletedServices.size()))
+                    report.append("--------------------------------------------------------------------------------\n\n")
+
+                    if (breakingChanges) {
+                        report.append("[ 🚨 BREAKING CONTRACT ALERTS - ACTION REQUIRED BEFORE GOING LIVE! ]\n")
+                        int bcIdx = 1
+                        for (Map bc : breakingChanges) {
+                            report.append(String.format("  %2d. Service: %s\n", bcIdx, bc.serviceName))
+                            report.append("      - Component : ${bc.component} (${bc.repo})\n")
+                            report.append("      - File      : ${bc.filePath}\n")
+                            report.append("      - Severity  : ${bc.severity}\n")
+                            report.append("      - Problem   : ${bc.message}\n\n")
+                            bcIdx++
+                        }
+                    }
+
+                    if (deletedServices) {
+                        report.append("[ ⚠️ DELETED / RENAMED SERVICES ]\n")
+                        int delIdx = 1
+                        for (Map ds : deletedServices) {
+                            report.append(String.format("  %2d. Service: %s (%s)\n", delIdx, ds.serviceName, ds.component))
+                            report.append("      - File: ${ds.filePath}\n\n")
+                            delIdx++
+                        }
+                    }
+
+                    if (newServices) {
+                        report.append("[ ✨ NEW SERVICES INTRODUCED (${newServices.size()}) ]\n")
+                        int nsIdx = 1
+                        for (Map ns : newServices) {
+                            report.append(String.format("  %2d. %s  [%s]\n", nsIdx, ns.serviceName, ns.component))
+                            report.append("      - File   : ${ns.filePath}\n")
+                            report.append("      - Status : ${ns.loadStatus ?: 'PENDING'}\n\n")
+                            nsIdx++
+                        }
+                    }
+                }
+
+                if (breakingChanges.size() > 0) {
+                    overallStatus = "BREAKING_SERVICE_CHANGES_FOUND"
+                } else if (totalCritical > 0 && omissions.size() > 0) {
                     overallStatus = "CRITICAL_MISSING_AND_OMISSIONS_FOUND"
                 } else if (totalCritical > 0) {
                     overallStatus = autoApply ? "AUTO_REPAIRED" : "CRITICAL_MISSING_FOUND"
@@ -241,6 +298,7 @@
                 report.append("================================================================================\n")
                 report.append(String.format("  - Total Missing Records to Sync : %d\n", totalCritical))
                 report.append(String.format("  - Total Developer Code Omissions: %d\n", omissions.size()))
+                report.append(String.format("  - Service Breaking Changes      : %d\n", breakingChanges.size()))
                 report.append(String.format("  - Total Auto-Applied to Database: %d\n", totalApplied))
                 report.append(String.format("  - Overall Status                : %s\n", overallStatus))
                 report.append("================================================================================\n")
@@ -251,6 +309,9 @@
                 shiftedComponentsCount = shifts.size()
                 totalOmissionAlerts = omissions.size()
                 omissionAlerts = omissions
+                totalServiceBreakingChanges = breakingChanges.size()
+                serviceBreakingChanges = breakingChanges
+                newServicesIntroduced = newServices
                 resultsByEntity = results
                 combinedSyncXml = fullXml.length() > 0 ? "<entity-facade-xml>\n${fullXml.toString()}</entity-facade-xml>" : ""
                 summaryReport = report.toString()

@@ -46,7 +46,7 @@ class GitDiffScanner {
      */
     static Map<String, Map<String, Map<String, String>>> scanGitHubDiff(
             String githubRepos, String githubToken, String fromTag, String toTag, List<String> targetEntities,
-            String compName = null, List<Map> codeRefs = null) {
+            String compName = null, List<Map> codeRefs = null, ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
 
         Map<String, Map<String, Map<String, String>>> result = [:]
         for (String entity : targetEntities) result[entity] = [:]
@@ -83,7 +83,7 @@ class GitDiffScanner {
                 int responseCode = conn.getResponseCode()
                 if (responseCode == 200) {
                     BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream()))
-                    parseDiffStream(reader, targetEntities, result, repo, compName, "${fromTag}➔${toTag}", codeRefs)
+                    parseDiffStream(reader, targetEntities, result, repo, compName, "${fromTag}➔${toTag}", codeRefs, serviceCtx)
                     reader.close()
                     logger.info("GitDiffScanner: Successfully parsed GitHub diff from ${repo} for ${fromTag}..${toTag}")
                 } else if (responseCode == 404) {
@@ -104,7 +104,7 @@ class GitDiffScanner {
      */
     static Map<String, Map<String, Map<String, String>>> scanLocalGitDiff(
             String repoRoot, String fromTag, String toTag, List<String> targetEntities,
-            String compName = null, List<Map> codeRefs = null) {
+            String compName = null, List<Map> codeRefs = null, ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
 
         Map<String, Map<String, Map<String, String>>> result = [:]
         for (String entity : targetEntities) result[entity] = [:]
@@ -120,7 +120,7 @@ class GitDiffScanner {
             Process proc = pb.start()
 
             BufferedReader reader = new BufferedReader(new InputStreamReader(proc.inputStream))
-            parseDiffStream(reader, targetEntities, result, repoRoot, compName, "${fromTag}➔${toTag}", codeRefs)
+            parseDiffStream(reader, targetEntities, result, repoRoot, compName, "${fromTag}➔${toTag}", codeRefs, serviceCtx)
             reader.close()
             proc.waitFor()
         } catch (Exception e) {
@@ -132,12 +132,14 @@ class GitDiffScanner {
 
     private static void parseDiffStream(
             BufferedReader reader, List<String> targetEntities, Map<String, Map<String, Map<String, String>>> result,
-            String repo = null, String compName = null, String tagShift = null, List<Map> codeRefs = null) {
+            String repo = null, String compName = null, String tagShift = null, List<Map> codeRefs = null,
+            ServiceContractScanner.ServiceDiffContext serviceCtx = null) {
 
         String line
         String currentFile = ""
         boolean inDataXml = false
         boolean inCodeFile = false
+        boolean isServiceXml = false
 
         while ((line = reader.readLine()) != null) {
             // Check file header to identify current file path and type
@@ -150,7 +152,17 @@ class GitDiffScanner {
                 }
                 String lower = currentFile.toLowerCase()
                 inDataXml = lower.contains("/data/") || lower.contains("/upgrade/") || lower.endsWith("data.xml")
-                inCodeFile = !inDataXml && (lower.endsWith(".groovy") || lower.endsWith(".java") || lower.endsWith(".xml") || lower.endsWith(".js") || lower.endsWith(".ts"))
+                isServiceXml = lower.contains("/service/") && lower.endsWith(".xml")
+                inCodeFile = !inDataXml && !isServiceXml && (lower.endsWith(".groovy") || lower.endsWith(".java") || lower.endsWith(".xml") || lower.endsWith(".js") || lower.endsWith(".ts"))
+            }
+
+            // 1. Service Contract & Breaking Change Scanner
+            if (isServiceXml && serviceCtx != null) {
+                try {
+                    ServiceContractScanner.processLine(line, currentFile, repo, compName, tagShift, serviceCtx)
+                } catch (Exception e) {
+                    logger.debug("Error in ServiceContractScanner: ${e.message}")
+                }
             }
 
             // Lines added in the diff (starting with + but not ++)
@@ -158,7 +170,7 @@ class GitDiffScanner {
                 String cleanLine = line.substring(1).trim()
                 if (cleanLine.isEmpty()) continue
 
-                // 1. Data XML entity tag parsing
+                // 2. Data XML entity tag parsing
                 if (inDataXml) {
                     for (String entity : targetEntities) {
                         String shortName = entity.contains(".") ? entity.substring(entity.lastIndexOf('.') + 1) : entity
@@ -172,7 +184,7 @@ class GitDiffScanner {
                     }
                 }
 
-                // 2. Code file scanning for ghost/orphan enum & status references
+                // 3. Code file scanning for ghost/orphan enum & status references
                 if (inCodeFile && codeRefs != null) {
                     try {
                         CodeReferenceScanner.scanLineForReferences(cleanLine, currentFile, repo, compName, tagShift, codeRefs)
