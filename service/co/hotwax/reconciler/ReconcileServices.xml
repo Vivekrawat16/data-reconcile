@@ -61,6 +61,9 @@
             <parameter name="totalServiceBreakingChanges" type="Integer"/>
             <parameter name="serviceBreakingChanges" type="List"/>
             <parameter name="newServicesIntroduced" type="List"/>
+            <parameter name="totalAtRiskScheduledJobs" type="Integer"/>
+            <parameter name="atRiskScheduledJobs" type="List"/>
+            <parameter name="scriptLocationAlerts" type="List"/>
             <parameter name="resultsByEntity" type="Map"/>
             <parameter name="combinedSyncXml"/>
             <parameter name="summaryReport"/>
@@ -72,6 +75,7 @@
                 String compPath = ec.factory.getRuntimePath() + "/component/data-reconciler"
                 Class codeScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/CodeReferenceScanner.groovy"))
                 Class serviceScannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ServiceContractScanner.groovy"))
+                Class validatorClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/ServiceIntegrityValidator.groovy"))
                 Class scannerClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/GitDiffScanner.groovy"))
                 Class resolverClass = gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/DockerConfigReleaseResolver.groovy"))
                 gcl.parseClass(new File(compPath + "/src/main/groovy/co/hotwax/reconciler/RemoteInstanceClient.groovy"))
@@ -281,7 +285,51 @@
                     }
                 }
 
-                if (breakingChanges.size() > 0) {
+                // 5. Phase 2: Deep Service Integrity & Scheduled Job Pre-Flight Audit
+                def phase2Result = validatorClass.runAudit(ec, serviceCtx)
+                List<Map<String, Object>> brokenJobs = (List<Map<String, Object>>) phase2Result.brokenScheduledJobAlerts
+                List<Map<String, Object>> scriptAlerts = (List<Map<String, Object>>) phase2Result.scriptLocationAlerts
+
+                if (brokenJobs || scriptAlerts || phase2Result.totalScriptsVerified > 0 || phase2Result.totalScheduledJobsAudited > 0) {
+                    report.append("================================================================================\n")
+                    report.append("               PHASE 2: DEEP SERVICE INTEGRITY & PRE-FLIGHT AUDIT               \n")
+                    report.append("================================================================================\n")
+                    report.append(String.format("  - Service Scripts Verified on Disk : %d\n", phase2Result.totalScriptsVerified))
+                    report.append(String.format("  - Script Location Alerts           : %d\n", scriptAlerts.size()))
+                    report.append(String.format("  - Scheduled Jobs Audited           : %d\n", phase2Result.totalScheduledJobsAudited))
+                    report.append(String.format("  - At-Risk Scheduled Jobs           : %d\n", brokenJobs.size()))
+                    report.append("--------------------------------------------------------------------------------\n\n")
+
+                    if (brokenJobs) {
+                        report.append("[ 🚨 AT-RISK SCHEDULED JOBS (WILL FAIL ON NEXT CRON RUN!) ]\n")
+                        int bjIdx = 1
+                        for (Map bj : brokenJobs) {
+                            report.append(String.format("  %2d. Job Name      : %s (Active, Paused: %s)\n", bjIdx, bj.jobName, bj.paused))
+                            report.append("      - Service       : ${bj.serviceName}\n")
+                            report.append("      - Missing Param : ${bj.missingParam} (required=\"true\")\n")
+                            report.append("      - Component     : ${bj.component}\n")
+                            report.append("      - Impact        : ${bj.message}\n\n")
+                            bjIdx++
+                        }
+                    }
+
+                    if (scriptAlerts) {
+                        report.append("[ ⚠️ SCRIPT LOCATION ALERTS (FILE NOT FOUND ON DISK) ]\n")
+                        int slIdx = 1
+                        for (Map sl : scriptAlerts) {
+                            report.append(String.format("  %2d. Service   : %s (%s)\n", slIdx, sl.serviceName, sl.component))
+                            report.append("      - Location : ${sl.location}\n")
+                            report.append("      - Problem  : ${sl.message}\n\n")
+                            slIdx++
+                        }
+                    }
+                }
+
+                if (brokenJobs.size() > 0) {
+                    overallStatus = "CRITICAL_SCHEDULED_JOBS_AT_RISK"
+                } else if (scriptAlerts.size() > 0) {
+                    overallStatus = "SERVICE_SCRIPTS_MISSING"
+                } else if (breakingChanges.size() > 0) {
                     overallStatus = "BREAKING_SERVICE_CHANGES_FOUND"
                 } else if (totalCritical > 0 && omissions.size() > 0) {
                     overallStatus = "CRITICAL_MISSING_AND_OMISSIONS_FOUND"
@@ -299,6 +347,7 @@
                 report.append(String.format("  - Total Missing Records to Sync : %d\n", totalCritical))
                 report.append(String.format("  - Total Developer Code Omissions: %d\n", omissions.size()))
                 report.append(String.format("  - Service Breaking Changes      : %d\n", breakingChanges.size()))
+                report.append(String.format("  - At-Risk Scheduled Jobs        : %d\n", brokenJobs.size()))
                 report.append(String.format("  - Total Auto-Applied to Database: %d\n", totalApplied))
                 report.append(String.format("  - Overall Status                : %s\n", overallStatus))
                 report.append("================================================================================\n")
@@ -312,6 +361,9 @@
                 totalServiceBreakingChanges = breakingChanges.size()
                 serviceBreakingChanges = breakingChanges
                 newServicesIntroduced = newServices
+                totalAtRiskScheduledJobs = brokenJobs.size()
+                atRiskScheduledJobs = brokenJobs
+                scriptLocationAlerts = scriptAlerts
                 resultsByEntity = results
                 combinedSyncXml = fullXml.length() > 0 ? "<entity-facade-xml>\n${fullXml.toString()}</entity-facade-xml>" : ""
                 summaryReport = report.toString()
